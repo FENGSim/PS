@@ -2,7 +2,7 @@ sudo apt -y install cmake make gcc g++ gfortran libreadline-dev tzdata libx11-de
 
 mkdir build
 cd build
-./../configure --prefix=$PWD/../../install/r_install
+./../configure --prefix=$PWD/../../install/r_install --enable-R-shlib
 make -j4
 make install
 
@@ -10,4 +10,7 @@ make install
 
 cd ../../install/r_install/bin/
 ./R CMD INSTALL ../../../r/spc_0.7.1.tar.gz
+./R CMD INSTALL ../../../r/Rcpp_1.1.0.tar.gz
+./R CMD INSTALL ../../../r/RInside_0.2.19.tar.gz
+./R CMD INSTALL ../../../r/qcc_2.7.tar.gz
 cd ../../../r
