@@ -1,0 +1,110 @@
+/* --------------------------------------------------
+   Copyright (C): OpenGATE Collaboration
+   This software is distributed under the terms
+   of the GNU Lesser General  Public Licence (LGPL)
+   See LICENSE.md for further details
+   -------------------------------------------------- */
+
+#include "GateVActor.h"
+#include <pybind11/pybind11.h>
+
+/*
+ * The "trampoline" functions below are required if we want to
+ * allow callbacks on the py side.
+ *
+ * If it is not needed: do not define trampoline functions in class that inherit
+ * from VActor.
+ *
+ * It must be defined also in all classes that inherit from GateVActor
+ *
+ * Hence, BeginOfRunAction, BeginOfEventAction etc maybe define in py side
+ * (but it will be slower, especially for steps)
+ */
+
+// for the moment, we don't need that. So it is commented
+
+class PyGateVActor : public GateVActor {
+public:
+  // Inherit the constructors
+  using GateVActor::GateVActor;
+
+  void BeginOfRunActionMasterThread(int run_id) override {
+    PYBIND11_OVERLOAD(void, GateVActor, BeginOfRunActionMasterThread, run_id);
+  }
+
+  int EndOfRunActionMasterThread(int run_id) override {
+    PYBIND11_OVERLOAD(int, GateVActor, EndOfRunActionMasterThread, run_id);
+  }
+
+  //    void SteppingAction(G4Step *step) override {
+  //        PYBIND11_OVERLOAD(void, GateVActor, SteppingAction, step);
+  //    }
+  //
+  //    void BeginOfRunAction(const G4Run *Run) override {
+  //        PYBIND11_OVERLOAD(void, GateVActor, BeginOfRunAction, Run);
+  //    }
+  //
+  //    void EndOfRunAction(const G4Run *Run) override {
+  //        PYBIND11_OVERLOAD(void, GateVActor, EndOfRunAction, Run);
+  //    }
+  //
+  //    void BeginOfEventAction(const G4Event *event) override {
+  //        PYBIND11_OVERLOAD(void, GateVActor, BeginOfEventAction, event);
+  //    }
+  //
+  //    void EndOfEventAction(const G4Event *event) override {
+  //        PYBIND11_OVERLOAD(void, GateVActor, EndOfEventAction, event);
+  //    }
+  //
+  //    void PreUserTrackingAction(const G4Track *track) override {
+  //        PYBIND11_OVERLOAD(void, GateVActor, PreUserTrackingAction, track);
+  //    }
+  //
+  //    void PostUserTrackingAction(const G4Track *track) override {
+  //        PYBIND11_OVERLOAD(void, GateVActor, PostUserTrackingAction, track);
+  //    }
+};
+
+void init_GateVActor(py::module &m) {
+
+  // do not inherit from trampoline for the moment (not needed)
+  py::class_<GateVActor, PyGateVActor>(m, "GateVActor")
+      .def(py::init<py::dict &>())
+      .def("RegisterSD", &GateVActor::RegisterSD)
+      // .def_readonly("fActions", &GateVActor::fActions) // avoid wrapping
+      // this -> problems with pickle
+      .def_readwrite("fFilter", &GateVActor::fFilter)
+      .def("Close", &GateVActor::Close)
+      .def("InitializeCpp", &GateVActor::InitializeCpp)
+      .def("InitializeUserInfo", &GateVActor::InitializeUserInfo)
+      .def("AddActions", &GateVActor::AddActions)
+      .def("IsSensitiveDetector", &GateVActor::IsSensitiveDetector)
+      .def("HasAction", &GateVActor::HasAction)
+      .def("SetMotherAttachedToVolumeName",
+           &GateVActor::SetMotherAttachedToVolumeName)
+      .def("ClearAttachedVolumeExitPairs",
+           &GateVActor::ClearAttachedVolumeExitPairs)
+      .def("AddAttachedVolumeExitPair", &GateVActor::AddAttachedVolumeExitPair)
+      .def("StartSimulationAction", &GateVActor::StartSimulationAction)
+      .def("EndSimulationAction", &GateVActor::EndSimulationAction)
+      .def("BeginOfRunAction", &GateVActor::BeginOfRunAction)
+      .def("BeginOfRunActionMasterThread",
+           &GateVActor::BeginOfRunActionMasterThread)
+      .def("EndOfRunAction", &GateVActor::EndOfRunAction)
+      .def("EndOfRunActionMasterThread",
+           &GateVActor::EndOfRunActionMasterThread)
+      .def("BeginOfEventAction", &GateVActor::BeginOfEventAction)
+      .def("EndOfEventAction", &GateVActor::EndOfEventAction)
+      .def("PreUserTrackingAction", &GateVActor::PreUserTrackingAction)
+      .def("PostUserTrackingAction", &GateVActor::PostUserTrackingAction)
+      .def("NewStage", &GateVActor::NewStage)
+      .def("GetOutputPath", &GateVActor::GetOutputPath)
+      .def("SetOutputPath", &GateVActor::SetOutputPath)
+      .def("GetOutputTreeNames", &GateVActor::GetOutputTreeNames)
+      .def("AddOutputTreeName", &GateVActor::AddOutputTreeName)
+      .def("GetOutputTreeInfo", &GateVActor::GetOutputTreeInfo)
+      .def("GetWriteToDisk", &GateVActor::GetWriteToDisk)
+      .def("SetWriteToDisk", &GateVActor::SetWriteToDisk)
+      .def("AddActorOutputInfo", &GateVActor::AddActorOutputInfo)
+      .def("SteppingAction", &GateVActor::SteppingAction);
+}

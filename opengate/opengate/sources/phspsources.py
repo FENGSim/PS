@@ -1,0 +1,590 @@
+import uproot
+import numpy as np
+import numbers
+from scipy.spatial.transform import Rotation
+from box import Box
+import sys
+
+import opengate_core as g4
+from ..exception import fatal, warning
+from .generic import SourceBase
+from ..base import process_cls
+
+
+class PhaseSpaceSourceGenerator:
+    """
+    Class that read phase space root file and extract position/direction/energy/weights of particles.
+    Particles information will be copied to the c++ side to be used as a source
+    """
+
+    def __init__(self, tid):
+        self.phsp_source = None
+        self.tid = tid
+        self.root_file = None
+        self.num_entries = 0
+        self.cycle_count = 0
+        self.cycle_changed_flag = False
+        # used during generation
+        self.batch = None
+        self.points = None
+        self.current_index = 0
+        self.w = None
+        # need to avoid garbage collection
+        self.pos_x = None
+        self.pos_y = None
+        self.pos_z = None
+        self.dir_x = None
+        self.dir_y = None
+        self.dir_z = None
+        self.energy = None
+        self.pdg = None
+        self.name = None
+        self.weight = None
+
+    def initialize(self, phsp_source):
+        self.phsp_source = phsp_source
+        self.name = phsp_source.name
+        # set the keys and entry start
+        self.read_phsp_and_keys()
+
+    def read_phsp_and_keys(self):
+        # convert str like 1e5 to int
+        self.phsp_source.batch_size = int(self.phsp_source.batch_size)
+        if self.phsp_source.batch_size < 1:
+            fatal("PhaseSpaceSourceGenerator: Batch size should be > 0")
+
+        if g4.IsMultithreadedApplication() and g4.G4GetThreadId() == -1:
+            # do nothing for master thread
+            return
+
+        # open root file and get the first branch
+        # FIXME could have an option to select the branch
+        self.root_file = uproot.open(self.phsp_source.phsp_file)
+        branches = self.root_file.keys()
+        if len(branches) > 0:
+            self.root_file = self.root_file[branches[0]]
+        else:
+            fatal(
+                f"PhaseSpaceSourceGenerator: No usable branches in the root file {self.phsp_source.phsp_file}. Aborting."
+            )
+            sys.exit()
+
+        self.num_entries = int(self.root_file.num_entries)
+
+        # initialize the index to start
+        tid = g4.G4GetThreadId()
+        self.current_index = self.get_entry_start(self.phsp_source.entry_start)
+
+        # initialize counters
+        self.cycle_count = 0
+
+    def get_entry_start(self, entry_start):
+        if not g4.IsMultithreadedApplication():
+            if not isinstance(entry_start, numbers.Number):
+                fatal("entry_start must be a simple number in mono-thread mode")
+            n = int(entry_start % self.num_entries)
+            if entry_start > self.num_entries:
+                warning(
+                    f"In source {self.name} "
+                    f"entry_start = {entry_start} while "
+                    f"the phsp contains {self.num_entries}. "
+                    f"We consider {n} instead (modulo)"
+                )
+            return n
+        tid = g4.G4GetThreadId()
+
+        if tid < 0:
+            # no entry start needed for master thread
+            return 0
+        n_threads = g4.GetNumberOfRunningWorkerThreads()
+        if isinstance(entry_start, numbers.Number):
+            fatal(f"entry_start must be a list in multi-thread mode")
+        if len(entry_start) != n_threads:
+            fatal(
+                f"Error: entry_start must be a vector of length the nb of threads, "
+                f"but it is {len(entry_start)} instead of {n_threads}"
+            )
+        n = int(entry_start[self.tid] % self.num_entries)
+        if entry_start[tid] > self.num_entries:
+            warning(
+                f"In source {self.name} "
+                f"entry_start = {entry_start} (thread {tid}) "
+                f"while the phsp contains {self.num_entries}. "
+                f"We consider {n} instead (modulo)"
+            )
+        return n
+
+    def generate(self, g4_source, pid):
+        """
+        Main function called from C++ to generate a batch of particles.
+        """
+        # --- 1. Cycle Management ---
+        if self.current_index >= self.num_entries:
+            self.current_index = 0
+
+        if self.cycle_changed_flag:
+            warning(
+                f"End of the phase-space {self.num_entries} elements, "
+                f"restart from beginning. Cycle count = {self.cycle_count}"
+            )
+            self.cycle_changed_flag = False
+
+        # --- 2. Calculate Batch Size ---
+        requested_batch_size = self.phsp_source.batch_size
+
+        if self.current_index + requested_batch_size >= self.num_entries:
+            requested_batch_size = self.num_entries - self.current_index
+            self.cycle_count += 1
+            self.cycle_changed_flag = True
+
+        if requested_batch_size == 0:
+            self.current_index = 0
+            requested_batch_size = min(self.phsp_source.batch_size, self.num_entries)
+            self.cycle_count += 1
+            self.cycle_changed_flag = True
+
+        if self.phsp_source.verbose_batch:
+            print(
+                f"Thread {g4.G4GetThreadId()} reading {requested_batch_size} events from index {self.current_index}"
+            )
+
+        # --- 3. Read Data ---
+        # We store 'batch' in self to keep the raw data alive
+        self.batch = self.root_file.arrays(
+            entry_start=self.current_index,
+            entry_stop=self.current_index + requested_batch_size,
+            library="numpy",
+        )
+        batch = self.batch
+        self.current_index += requested_batch_size
+
+        # --- 4. Paranoid Data Extractor ---
+        def get_data(key, dtype, must_exist=True):
+            raw = None
+            if hasattr(batch, "dtype") and batch.dtype.names:
+                if key in batch.dtype.names:
+                    raw = batch[key]
+            elif isinstance(batch, dict) and key in batch:
+                raw = batch[key]
+
+            if raw is None:
+                if must_exist:
+                    avail = (
+                        batch.dtype.names
+                        if hasattr(batch, "dtype")
+                        else list(batch.keys())
+                    )
+                    fatal(
+                        f"PhaseSpaceSource: Key '{key}' not found. Available: {avail}"
+                    )
+                return None
+
+            try:
+                # copy=True creates a new array. We MUST store this new array in 'self' later!
+                return np.array(raw, dtype=dtype, copy=True, order="C")
+            except Exception as e:
+                fatal(f"PhaseSpaceSource: Conversion error for '{key}'. {e}")
+
+        # --- 5. Extract & STORE IN SELF (Prevent GC) ---
+
+        # We assign to 'self.X' to ensure the Python object survives
+        # as long as the C++ side needs it (until the next batch overwrites it).
+
+        self.pos_x = get_data(self.phsp_source.position_key_x, np.float32)
+        actual_size = len(self.pos_x)
+
+        self.pos_y = get_data(self.phsp_source.position_key_y, np.float32)
+        self.pos_z = get_data(self.phsp_source.position_key_z, np.float32)
+
+        self.dir_x = get_data(self.phsp_source.direction_key_x, np.float32)
+        self.dir_y = get_data(self.phsp_source.direction_key_y, np.float32)
+        self.dir_z = get_data(self.phsp_source.direction_key_z, np.float32)
+
+        self.energy = get_data(self.phsp_source.energy_key, np.float32)
+
+        # Weights
+        self.weight = None
+        if self.phsp_source.weight_key:
+            self.weight = get_data(
+                self.phsp_source.weight_key, np.float32, must_exist=False
+            )
+        if self.weight is None:
+            self.weight = np.ones(actual_size, dtype=np.float32)
+
+        # PDG Code
+        self.pdg = None
+        if not self.phsp_source.particle:
+            self.pdg = get_data(self.phsp_source.PDGCode_key, np.int32)
+
+        # --- 6. Transforms (Modify SELF) ---
+        if self.phsp_source.translate_position:
+            self.pos_x += float(self.phsp_source.position.translation[0])
+            self.pos_y += float(self.phsp_source.position.translation[1])
+            self.pos_z += float(self.phsp_source.position.translation[2])
+
+        if self.phsp_source.rotate_direction:
+            points = np.column_stack((self.dir_x, self.dir_y, self.dir_z))
+            r = Rotation.from_matrix(self.phsp_source.position.rotation)
+            rotated = r.apply(points)
+            self.dir_x = np.ascontiguousarray(rotated[:, 0], dtype=np.float32)
+            self.dir_y = np.ascontiguousarray(rotated[:, 1], dtype=np.float32)
+            self.dir_z = np.ascontiguousarray(rotated[:, 2], dtype=np.float32)
+
+        # --- 7. Send to C++ ---
+        if len(self.energy) != actual_size:
+            fatal(f"Size mismatch: Pos {actual_size} vs Energy {len(self.energy)}")
+
+        # Pass the SELF variables to C++
+        g4_source.SetPositionXBatch(self.pos_x)
+        g4_source.SetPositionYBatch(self.pos_y)
+        g4_source.SetPositionZBatch(self.pos_z)
+        g4_source.SetDirectionXBatch(self.dir_x)
+        g4_source.SetDirectionYBatch(self.dir_y)
+        g4_source.SetDirectionZBatch(self.dir_z)
+        g4_source.SetEnergyBatch(self.energy)
+        g4_source.SetWeightBatch(self.weight)
+
+        if self.pdg is not None:
+            g4_source.SetPDGCodeBatch(self.pdg)
+
+        return actual_size
+
+
+class PhaseSpaceSource(SourceBase):
+    """
+    Source of particles from a (root) phase space.
+    Read position + direction + energy + weight from the root and use them as event.
+
+    If "global flag" is True, the position/direction are global, ie in the world coordinate system.
+    If it is False, it uses the coordinate system of the volume it is attached to.
+
+    The Time in the phsp is not implemented (yet)
+    """
+
+    # hints for IDE
+    phsp_file: str
+    entry_start: int
+    particle: str
+    global_flag: bool
+    isotropic_momentum: bool
+    translate_position: bool
+    rotate_direction: bool
+    batch_size: int
+    position_key: str
+    position_key_x: str
+    position_key_y: str
+    position_key_z: str
+    direction_key: str
+    direction_key_x: str
+    direction_key_y: str
+    direction_key_z: str
+    energy_key: str
+    weight_key: str
+    PDGCode_key: str
+    generate_until_next_primary: bool
+    primary_lower_energy_threshold: float
+    primary_PDGCode: int
+    verbose: bool
+
+    @staticmethod
+    def _as_total_number_of_events(number_of_primaries):
+        """Return the total event count represented by scalar or per-run primaries."""
+        counts = np.asarray(number_of_primaries, dtype=float)
+        if counts.shape == ():
+            return int(counts)
+        return int(np.sum(counts))
+
+    @classmethod
+    def get_number_of_events_per_lane(cls, number_of_primaries, number_of_lanes):
+        """Return the entry spacing used to distribute PHSP reads over lanes."""
+        total_number_of_events = cls._as_total_number_of_events(number_of_primaries)
+        return int(np.ceil(total_number_of_events / number_of_lanes)) + 1
+
+    @classmethod
+    def generate_entry_start_list(
+        cls,
+        number_of_events_to_be_split,
+        n_threads,
+        offset=0,
+    ):
+        """Generate per-thread phase-space entry starts.
+
+        ``n_threads`` controls the length of the returned list. ``offset`` and
+        ``step`` are entry-space quantities, so callers that coordinate multiple
+        simulations can inject their own campaign-level layout while this method
+        keeps the thread-local list construction in the source.
+        """
+        number_of_events_per_split = cls.get_number_of_events_per_lane(
+            number_of_events_to_be_split, n_threads
+        )
+        return [int(offset + i * number_of_events_per_split) for i in range(n_threads)]
+
+    user_info_defaults = {
+        "phsp_file": (
+            None,
+            {
+                # FIXME: this file-backed input is still modeled as a plain
+                # string-like parameter. Consider migrating to Path-based user
+                # info handling consistently across serialized inputs.
+                "doc": "Filename of the phase-space file (root). This is required",
+                "is_input_file": True,
+            },
+        ),
+        "entry_start": (
+            None,
+            {
+                "doc": "Starting particle in the phase-space (for MT, provide a list of entries, one for each thread)"
+            },
+        ),
+        "particle": ("", {"doc": "FIXME"}),
+        "global_flag": (
+            False,
+            {
+                "doc": "If true, the positions of the generated particles in the phase-space "
+                "are in the world coordinate system. If false, they are relative to the volume"
+                "this source is attached to",
+            },
+        ),
+        "isotropic_direction": (
+            False,
+            {
+                "doc": "If true, It enables to generate a particle with a position energy and weight "
+                "according to the provided phase but with an isotropic momentum.",
+            },
+        ),
+        "translate_position": (
+            False,
+            {
+                "doc": "FIXME",
+            },
+        ),
+        "rotate_direction": (
+            False,
+            {
+                "doc": "FIXME",
+            },
+        ),
+        "batch_size": (
+            10000,
+            {
+                "doc": "Batch size to read the phsp",
+            },
+        ),
+        "position_key": (
+            "PrePositionLocal",
+            {
+                "doc": "Key in the phsp that contain the position of the particle. Automatically set the"
+                " position_key_x, position_key_y, position_key_z keys by adding _X _Y _Z",
+                # "setter_hook": _setter_hook_phsp_source_3d_keys,
+            },
+        ),
+        "position_key_x": (
+            None,
+            {
+                "doc": "Key in the phsp that contain the position X of the particle",
+            },
+        ),
+        "position_key_y": (
+            None,
+            {
+                "doc": "Key in the phsp that contain the position Y of the particle",
+            },
+        ),
+        "position_key_z": (
+            None,
+            {
+                "doc": "Key in the phsp that contain the position Z of the particle",
+            },
+        ),
+        "position": (
+            Box(
+                {"translation": [0, 0, 0], "rotation": Rotation.identity().as_matrix()}
+            ),
+            {
+                "doc": "Default position+rotation if it is not read in the phsp",
+            },
+        ),
+        "direction_key": (
+            "PreDirectionLocal",
+            {
+                "doc": "Key in the phsp that contain the direction of the particle. Automatically set the"
+                " direction_key_x, direction_key_y, direction_key_z keys by adding _X _Y _Z",
+                # "setter_hook": _setter_hook_phsp_source_3d_keys,
+            },
+        ),
+        "direction_key_x": (
+            None,
+            {
+                "doc": "Key in the phsp that contain the direction X of the particle",
+            },
+        ),
+        "direction_key_y": (
+            None,
+            {
+                "doc": "Key in the phsp that contain the direction Y of the particle",
+            },
+        ),
+        "direction_key_z": (
+            None,
+            {
+                "doc": "Key in the phsp that contain the direction Z of the particle",
+            },
+        ),
+        "energy_key": (
+            "KineticEnergy",
+            {
+                "doc": "Key in the phsp that contain the energy of the particle",
+            },
+        ),
+        "weight_key": (
+            "Weight",
+            {
+                "doc": "Key in the phsp that contain the weight of the particle",
+            },
+        ),
+        "PDGCode_key": (
+            "PDGCode",
+            {
+                "doc": "Key in the phsp that contains the PDGCode of the particle (particle type) "
+                "see https://pdg.lbl.gov/2007/reviews/montecarlorpp.pdf",
+            },
+        ),
+        "generate_until_next_primary": (
+            False,
+            {
+                "doc": "FIXME ",
+            },
+        ),
+        "primary_lower_energy_threshold": (
+            0,
+            {
+                "doc": "FIXME ",
+            },
+        ),
+        "primary_PDGCode": (
+            0,
+            {
+                "doc": "FIXME ",
+            },
+        ),
+        "verbose": (
+            False,
+            {
+                "doc": "FIXME ",
+            },
+        ),
+        "verbose_batch": (
+            False,
+            {
+                "doc": "FIXME ",
+            },
+        ),
+    }
+
+    def __init__(self, *args, **kwargs):
+        SourceBase.__init__(self, *args, **kwargs)
+        # there will be one particle generator per thread
+        self.particle_generators = {}
+        # number of entries in the phsp root file
+        self.num_entries = None
+
+    def __getstate__(self):
+        # the particle generator cannot (?) being pickled
+        # we convert in a dict with the cycle count values
+        all_pg = self.particle_generators
+        self.particle_generators = {}
+        for k, pg in all_pg.items():
+            self.particle_generators[k] = Box({"cycle_count": pg.cycle_count})
+        state_dict = super().__getstate__()
+        return state_dict
+
+    def create_g4_source(self):
+        return g4.GatePhaseSpaceSource()
+
+    def initialize_g4_source(self, g4_source, run_timing_intervals):
+        # Calculate the target thread ID for this g4_source
+        if g4.IsMultithreadedApplication():
+            try:
+                thread_idx = self.g4_thread_sources.index(g4_source)
+            except ValueError:
+                thread_idx = 0
+            tid = thread_idx - 1
+        else:
+            tid = 0
+
+        # Master source does not need generator
+        if tid < 0:
+            return
+
+        # Create/initialize the generator for this thread
+        if tid not in self.particle_generators:
+            self.particle_generators[tid] = PhaseSpaceSourceGenerator(tid)
+
+        # check if the source should generate particles until the second one
+        # which is identified as primary by name, PDGCode and above a threshold
+        if self.generate_until_next_primary:
+            if self.primary_PDGCode == 0:
+                fatal(
+                    "PhaseSpaceSource: generate_until_next_primary is True but no primary particle is defined"
+                )
+            if self.primary_lower_energy_threshold <= 0:
+                fatal(
+                    "PhaseSpaceSource: generate_until_next_primary is True but no "
+                    "primary_lower_energy_threshold is defined"
+                )
+
+        # if not set, initialize the entry_start to 0 or to a list for multithreading
+        if self.entry_start is None:
+            if not g4.IsMultithreadedApplication():
+                self.entry_start = 0
+            else:
+                n_threads = self.simulation.number_of_threads
+                self.entry_start = self.generate_entry_start_list(
+                    self.number_of_primaries, n_threads
+                )
+
+        # check user info
+        if self.position_key_x is None:
+            self.position_key_x = f"{self.position_key}_X"
+        if self.position_key_y is None:
+            self.position_key_y = f"{self.position_key}_Y"
+        if self.position_key_z is None:
+            self.position_key_z = f"{self.position_key}_Z"
+
+        if self.direction_key_x is None:
+            self.direction_key_x = f"{self.direction_key}_X"
+        if self.direction_key_y is None:
+            self.direction_key_y = f"{self.direction_key}_Y"
+        if self.direction_key_z is None:
+            self.direction_key_z = f"{self.direction_key}_Z"
+
+        # Initialize base start/end times and check activity on the python side
+        self.initialize_start_end_time(run_timing_intervals)
+        runtime_user_info = self.build_runtime_user_info_for_g4_source(g4_source)
+        g4_source.InitializeUserInfo(runtime_user_info)
+
+        # initialize the generator (read the phsp file)
+        self.particle_generators[tid].initialize(self)
+
+        # keep a copy of the number of entries
+        self.num_entries = self.particle_generators[tid].num_entries
+
+        # set the function pointer to the cpp side
+        g4_source.SetGeneratorFunction(self.particle_generators[tid].generate)
+
+    @property
+    def cycle_count(self):
+        if not g4.IsMultithreadedApplication():
+            if not self.particle_generators:
+                return 0
+            key = list(self.particle_generators.keys())[0]
+            return self.particle_generators[key].cycle_count
+        else:
+            s = " ".join(
+                str(self.particle_generators[tid].cycle_count)
+                for tid in sorted(self.particle_generators.keys())
+            )
+            return s
+
+
+process_cls(PhaseSpaceSource)

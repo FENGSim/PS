@@ -1,0 +1,2991 @@
+from PIL import DcxImagePlugin
+import copy
+import io
+import os
+import random
+import shutil
+import weakref
+from pathlib import Path
+from typing import Callable, List, Optional, Union
+import sys
+import warnings
+
+import opengate_core as g4
+from anytree import LoopError, RenderTree
+from box import Box
+
+from .base import (
+    GateObject,
+    create_gate_object_from_dict,
+    find_all_gate_objects,
+    find_paths_in_gate_object_dictionary,
+    process_cls,
+)
+from .definitions import __world_name__
+from .engines import SimulationEngine
+from .exception import (
+    GateDeprecationError,
+    GateImplementationError,
+    fatal,
+    warning,
+)
+from .geometry.fields import FieldBase, field_types
+from .geometry.materials import MaterialDatabase
+from .logger import *
+
+from .decorators import requires_fatal
+from .physics import (
+    OpticalSurface,
+    Region,
+    PhysicsListBuilder,
+    cut_particle_names,
+    translate_particle_name_gate_to_geant4,
+)
+from .processing import dispatch_to_subprocess
+from .runtiming import assert_run_timing
+from .serialization import (
+    dump_json,
+    dumps_json,
+    load_json,
+    loads_json,
+    _apply_path_modifier_recursively,
+    _collect_input_file_values_from_gate_object_dictionary,
+    _find_metaimage_payload_files,
+    _rewrite_path_against_reference,
+)
+from .sources.base import DebugSource
+from .sources.beamsources import IonPencilBeamSource, TreatmentPlanPBSource
+from .sources.gansources import GANPairsSource, GANSource
+from .sources.generic import GenericSource, SourceBase
+from .sources.lastvertexsources import LastVertexSource
+from .sources.phidsources import PhotonFromIonDecaySource
+from .sources.phspsources import PhaseSpaceSource
+from .sources.voxelsources import VoxelizedPromptGammaTLESource, VoxelSource
+from .utility import (
+    ensure_directory_exists,
+    g4_units,
+    indent,
+    insert_suffix_before_extension,
+    read_mac_file_to_commands,
+)
+from .voxelize import voxelize_geometry
+
+source_types = {
+    "GenericSource": GenericSource,
+    "DebugSource": DebugSource,
+    "LastVertexSource": LastVertexSource,
+    "PhaseSpaceSource": PhaseSpaceSource,
+    "VoxelSource": VoxelSource,
+    "GANSource": GANSource,
+    "GANPairsSource": GANPairsSource,
+    "IonPencilBeamSource": IonPencilBeamSource,
+    "PhotonFromIonDecaySource": PhotonFromIonDecaySource,
+    "TreatmentPlanPBSource": TreatmentPlanPBSource,
+    "VoxelizedPromptGammaTLESource": VoxelizedPromptGammaTLESource,
+}
+
+from .actors.chemistryactors import ChemistryActorBase, ChemicalCountingActor
+from .chemistry import ChemistryList, ChemistryWorld
+from .actors.arfactors import ARFActor, ARFTrainingDatasetActor
+from .actors.base import ActorBase
+from .actors.biasingactors import (
+    BremsstrahlungSplittingActor,
+    GammaFreeFlightActor,
+    GenericBiasingActorBase,
+    LastVertexInteractionSplittingActor,
+    ScatterSplittingFreeFlightActor,
+)
+from .actors.digitizers import (
+    CoincidenceSorterActor,
+    DigiAttributeLastProcessDefinedStepInVolumeActor,
+    DigiAttributeProcessDefinedStepInVolumeActor,
+    DigitizerAdderActor,
+    DigitizerBlurringActor,
+    DigitizerEfficiencyActor,
+    DigitizerEnergyWindowsActor,
+    DigitizerHitsCollectionActor,
+    DigitizerDeadTimeActor,
+    DigitizerPileupActor,
+    DigitizerProjectionActor,
+    DigitizerReadoutActor,
+    DigitizerSpatialBlurringActor,
+    PhaseSpaceActor,
+)
+from .actors.doseactors import (
+    BeamQualityActor,
+    DoseActor,
+    EmCalculatorActor,
+    FluenceActor,
+    LETActor,
+    ProductionAndStoppingActor,
+    RBEActor,
+    REActor,
+    TLEDoseActor,
+)
+from .actors.dynamicactors import DynamicGeometryActor, DynamicSourceActor
+from .actors.filters import FilterBase, filter_classes, get_filter_class
+from .actors.miscactors import (
+    AttenuationImageActor,
+    DepositedChargeActor,
+    KillAccordingParticleNameActor,
+    KillAccordingProcessesActor,
+    KillActor,
+    KillNonInteractingParticleActor,
+    SimulationStatisticsActor,
+    DebugActor,
+)
+from .actors.pgactors import (
+    VoxelizedPromptGammaAnalogActor,
+    VoxelizedPromptGammaTLEActor,
+)
+from .geometry.volumes import (
+    BooleanVolume,
+    BoxVolume,
+    ConsVolume,
+    EllipsoidVolume,
+    HexagonVolume,
+    ImageVolume,
+    ParallelWorldVolume,
+    PolyhedraVolume,
+    RepeatParametrisedVolume,
+    SphereVolume,
+    TetrahedralMeshVolume,
+    TesselatedVolume,
+    TrapVolume,
+    TrdVolume,
+    TubsVolume,
+    VolumeBase,
+    VolumeTreeRoot,
+)
+from .auxiliary_attributes import AuxiliaryAttributeBase, auxiliary_attribute_types
+
+particle_names_Gate_to_G4 = {
+    "gamma": "gamma",
+    "electron": "e-",
+    "positron": "e+",
+    "proton": "proton",
+    "neutron": "neutron",
+}
+
+actor_types = {
+    # dose related
+    "DoseActor": DoseActor,
+    "TLEDoseActor": TLEDoseActor,
+    "LETActor": LETActor,
+    "ProductionAndStoppingActor": ProductionAndStoppingActor,
+    "RBEActor": RBEActor,
+    "REActor": REActor,
+    "BeamQualityActor": BeamQualityActor,
+    "EmCalculatorActor": EmCalculatorActor,
+    "FluenceActor": FluenceActor,
+    # misc
+    "VoxelizedPromptGammaTLEActor": VoxelizedPromptGammaTLEActor,
+    "VoxelizedPromptGammaAnalogActor": VoxelizedPromptGammaAnalogActor,
+    "AttenuationImageActor": AttenuationImageActor,
+    "SimulationStatisticsActor": SimulationStatisticsActor,
+    "KillActor": KillActor,
+    "KillAccordingProcessesActor": KillAccordingProcessesActor,
+    "KillNonInteractingParticleActor": KillNonInteractingParticleActor,
+    "KillAccordingParticleNameActor": KillAccordingParticleNameActor,
+    "DepositedChargeActor": DepositedChargeActor,
+    "DynamicGeometryActor": DynamicGeometryActor,
+    "DynamicSourceActor": DynamicSourceActor,
+    "ChemicalCountingActor": ChemicalCountingActor,
+    "ARFActor": ARFActor,
+    "ARFTrainingDatasetActor": ARFTrainingDatasetActor,
+    "DebugActor": DebugActor,
+    # digit
+    "PhaseSpaceActor": PhaseSpaceActor,
+    "DigitizerAdderActor": DigitizerAdderActor,
+    "DigitizerBlurringActor": DigitizerBlurringActor,
+    "DigitizerSpatialBlurringActor": DigitizerSpatialBlurringActor,
+    "DigitizerReadoutActor": DigitizerReadoutActor,
+    "DigitizerEfficiencyActor": DigitizerEfficiencyActor,
+    "DigitizerProjectionActor": DigitizerProjectionActor,
+    "DigitizerEnergyWindowsActor": DigitizerEnergyWindowsActor,
+    "DigitizerHitsCollectionActor": DigitizerHitsCollectionActor,
+    "DigitizerDeadTimeActor": DigitizerDeadTimeActor,
+    "DigitizerPileupActor": DigitizerPileupActor,
+    "CoincidenceSorterActor": CoincidenceSorterActor,
+    "DigiAttributeProcessDefinedStepInVolumeActor": DigiAttributeProcessDefinedStepInVolumeActor,
+    "DigiAttributeLastProcessDefinedStepInVolumeActor": DigiAttributeLastProcessDefinedStepInVolumeActor,
+    # biasing
+    "BremsstrahlungSplittingActor": BremsstrahlungSplittingActor,
+    "GammaFreeFlightActor": GammaFreeFlightActor,
+    "ScatterSplittingFreeFlightActor": ScatterSplittingFreeFlightActor,
+    "LastVertexInteractionSplittingActor": LastVertexInteractionSplittingActor,
+}
+
+
+class FilterManager:
+    """
+    Manage all the Filters in the simulation
+    """
+
+    def __init__(self, simulation):
+        self.simulation = simulation
+        # self.user_info_filters = {}
+        self.filters = {}
+
+    def __str__(self):
+        v = [v.name for v in self.filters.values()]
+        s = f'{" ".join(v)} ({len(self.filters)})'
+        return s
+
+    # @property
+    # def available_filters(self):
+    #    return list(filter_classes.keys())
+
+    def dump(self):
+        n = len(self.filters)
+        s = f"Number of filters: {n}"
+        for Filter in self.filters.values():
+            if n > 1:
+                a = "\n" + "-" * 20
+            else:
+                a = ""
+            a += f"\n {Filter}"
+            s += indent(2, a)
+        return s
+
+    def get_filter(self, name):
+        try:
+            return self.filters[name]
+        except KeyError:
+            fatal(
+                f"The Filter {name} is not in the current "
+                f"list of Filters: {self.filters}"
+            )
+
+    def add_filter(self, filter):
+        existing_filter = self.filters.get(filter.name)
+        if existing_filter is not None:
+            if existing_filter is filter:
+                return filter
+            fatal(f"A filter with the name {filter.name} already exists.")
+        self.filters[filter.name] = filter
+        return filter
+
+    def add_filter_deprecated(self, filt, name=None):
+        warnings.warn(
+            "FilterManager.add_filter_deprecated() is deprecated. "
+            "Use FilterManager.add_filter() with an explicit filter object instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if isinstance(filt, str):
+            if name is None:
+                fatal("You must provide a name for the filter.")
+            new_filter = self.create_filter_deprecated(filt, name)
+        elif isinstance(filt, FilterBase):
+            new_filter = filt
+        else:
+            fatal(
+                "You need to either provide a volume type and name, or a volume object."
+            )
+        if new_filter.name in self.filters:
+            fatal(f"A filter with the name {new_filter.name} already exists.")
+        self.filters[new_filter.name] = new_filter
+        if new_filter is not filt:
+            return new_filter
+
+    def create_filter_deprecated(self, filter_type, name):
+        warnings.warn(
+            "FilterManager.create_filter_deprecated() is deprecated. "
+            "Create the filter object explicitly instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return get_filter_class(filter_type)(name=name, simulation=self.simulation)
+
+    def resolve_and_validate_config(self, context=None):
+        for filter_obj in self.filters.values():
+            filter_obj.resolve_and_validate_config(context=context)
+
+
+class SourceManager(GateObject):
+    """
+    Manage all the sources in the simulation.
+    The function prepare_generate_primaries will be called during
+    the main run loop to set the current time and source.
+    """
+
+    def __init__(self, simulation, *args, **kwargs):
+        kwargs["name"] = "source_manager"
+        kwargs["simulation"] = simulation
+        super().__init__(*args, **kwargs)
+        # List of run times intervals
+        self.run_timing_intervals = None
+        self.current_run_interval = None
+        # List of sources user info
+        self.sources = {}
+
+    def __str__(self):
+        """
+        str only dumps the user info on a single line
+        """
+        v = [v.name for v in self.sources.values()]
+        s = f'{" ".join(v)} ({len(self.sources)})'
+        return s
+
+    def dump_source_types(self):
+        return "\n".join(list(source_types.keys()))
+
+    def dump_sources(self):
+        n = len(self.sources)
+        s = f"Number of sources: {n}"
+        for source in self.sources.values():
+            a = f"\n {source}"
+            s += indent(2, a)
+        return s
+
+    def get_source(self, source_name):
+        try:
+            return self.sources[source_name]
+        except KeyError:
+            fatal(
+                f"Cannot find the source {source_name}. "
+                f"Sources included in this simulation are: {list(self.sources.keys())}"
+            )
+            return None  # to avoid warning
+
+    @property
+    def dynamic_sources(self):
+        return [source for source in self.sources.values() if source.is_dynamic]
+
+    def add_source(self, source, name):
+        new_source = None
+        if isinstance(source, str):
+            if name is None:
+                fatal("You must provide a name for the source.")
+            new_source = self._create_source(source, name)
+        elif isinstance(source, SourceBase):
+            new_source = source
+        else:
+            fatal(
+                "You need to either provide an actor type and name, or an actor object."
+            )
+
+        if new_source.name in self.sources:
+            fatal(
+                f"The source named {new_source.name} already exists. "
+                f"Existing source names are: {self.sources.keys()}"
+            )
+        self.sources[new_source.name] = new_source
+        self.sources[new_source.name].simulation = self.simulation
+        # return the volume if it has not been passed as input, i.e. it was created here
+        if new_source is not source:
+            return new_source
+        return source
+
+    def add_source_copy(self, origin_source_name, copied_source_name):
+        # get the source to copy
+        orig = self.get_source(origin_source_name)
+        # get its type name
+        cls_name = type(orig).__name__
+        # create the new source
+        new_source = self.add_source(cls_name, copied_source_name)
+        # copy all elements except its name
+        new_source.user_info = copy.deepcopy(orig.user_info)
+        new_source.user_info.name = copied_source_name
+        return new_source
+
+    def remove_source(self, source_name):
+        if not source_name in self.sources:
+            fatal(
+                f"In 'remove_source', the source {source_name} is not in the list of sources: {self.sources}"
+            )
+        self.sources.pop(source_name)
+
+    def _create_source(self, source_type, name):
+        cls = None
+        try:
+            cls = source_types[source_type]
+        except KeyError:
+            fatal(
+                f"Unknown source type {source_type}. "
+                f"Known types are: \n."
+                f"{self.dump_source_types()}."
+            )
+        return cls(name=name, simulation=self.simulation)
+
+    def initialize_before_g4_engine(self):
+        if len(self.sources) == 0:
+            self.simulation.warn_user(
+                "No configured source, no particle will be generated."
+            )
+        for source in self.sources.values():
+            if source.initialize_source_before_g4_engine:
+                source.initialize_source_before_g4_engine(source)
+
+    def resolve_and_validate_config(self, context=None):
+        for source in self.sources.values():
+            # Resolve each source against the master simulation timing now so
+            # split jobs inherit explicit global timing anchors and normalized
+            # source configuration.
+            source.resolve_and_validate_config(
+                self.simulation.run_timing_intervals, context=context
+            )
+
+        dynamic_sources = self.dynamic_sources
+        for source in dynamic_sources:
+            source.check_if_dynamic_params_match_run_timing_intervals()
+
+        if len(dynamic_sources) > 0:
+            dynamic_source_actor = self.simulation.actor_manager.actors.get(
+                "dynamic_source_actor"
+            )
+            if dynamic_source_actor is None:
+                dynamic_source_actor = self.simulation.add_actor(
+                    "DynamicSourceActor", "dynamic_source_actor"
+                )
+            dynamic_source_actor.priority = 1
+            dynamic_source_actor.changers = []
+            for source in dynamic_sources:
+                dynamic_source_actor.changers.extend(source.create_changers())
+
+    def to_dictionary(self):
+        d = super().to_dictionary()
+        d["sources"] = dict([(k, v.to_dictionary()) for k, v in self.sources.items()])
+        return d
+
+    def from_dictionary(self, d):
+        self.sources = {}
+        super().from_dictionary(d)
+        for k, v in d["sources"].items():
+            s = self.add_source(v["object_type"], name=v["user_info"]["name"])
+            s.from_dictionary(v)
+
+
+class ActorManager(GateObject):
+    """
+    Manage all the actors in the simulation
+    """
+
+    def __init__(self, simulation, *args, **kwargs) -> None:
+        kwargs["name"] = "actor_manager"
+        kwargs["simulation"] = simulation
+        super().__init__(*args, **kwargs)
+        self.user_info_actors = {}
+        # dictionary of actor objects. Do not fill manually. Use add_actor() method.
+        self.actors = {}
+
+    def __str__(self):
+        s = "The actor manager contains the following actors: \n"
+        s += self.dump_actors()
+        return s
+
+    @property
+    def sorted_actors(self):
+        # consider the priority value of the actors
+        # dynamic geometry actors need to come first so
+        # other actors already 'see' the new geometry in their BeginOfRunAction
+        dynamic_geometry_actors = [
+            a for a in self.actors.values() if isinstance(a, DynamicGeometryActor)
+        ]
+        sorted_actors = [
+            a
+            for a in sorted(self.actors.values(), key=lambda a: a.priority)
+            if a not in dynamic_geometry_actors
+        ]
+        return dynamic_geometry_actors + sorted_actors
+
+    def has_chemistry_actors(self):
+        return any(
+            isinstance(actor, ChemistryActorBase) for actor in self.actors.values()
+        )
+
+    def reset(self):
+        self.__init__(simulation=self.simulation)
+
+    def resolve_and_validate_config(self, context=None):
+        for actor in self.sorted_actors:
+            actor.resolve_and_validate_config(context=context)
+
+    def compare_with(self, other, mode="merge_target_compatibility"):
+        """Compare this actor manager against another one and report differences.
+
+        The first implementation is intentionally conservative and focuses on the
+        structure needed by split-job merge: actor names and actor-output names.
+        Deeper semantic comparisons can be added later in the respective actor
+        classes without changing the merge-manager entry point.
+        """
+        differences = []
+
+        if not isinstance(other, ActorManager):
+            return [
+                f"Object type mismatch: expected ActorManager, received {type(other).__name__}."
+            ]
+
+        self_actor_names = set(self.actors.keys())
+        other_actor_names = set(other.actors.keys())
+        if self_actor_names != other_actor_names:
+            missing_in_self = sorted(other_actor_names - self_actor_names)
+            missing_in_other = sorted(self_actor_names - other_actor_names)
+            if missing_in_self:
+                differences.append(
+                    "Missing actors in target simulation: " f"{missing_in_self}."
+                )
+            if missing_in_other:
+                differences.append(
+                    "Extra actors in target simulation: " f"{missing_in_other}."
+                )
+
+        for actor_name in sorted(self_actor_names.intersection(other_actor_names)):
+            actor_differences = self.actors[actor_name].compare_with(
+                other.actors[actor_name], mode=mode
+            )
+            differences.extend(
+                [
+                    f"Actor '{actor_name}': {difference}"
+                    for difference in actor_differences
+                ]
+            )
+
+        return differences
+
+    def to_dictionary(self):
+        d = super().to_dictionary()
+        d["actors"] = dict([(k, v.to_dictionary()) for k, v in self.actors.items()])
+        return d
+
+    def from_dictionary(self, d):
+        self.reset()
+        super().from_dictionary(d)
+        # Create all actors
+        for k, v in d["actors"].items():
+            a = self.add_actor(v["object_type"], name=v["user_info"]["name"])
+            a.from_dictionary(v)
+
+    def get_actor(self, actor_name):
+        try:
+            return self.actors[actor_name]
+        except KeyError:
+            fatal(
+                f"Cannot find actor {actor_name}. "
+                f"Actors included in this simulation are: {list(self.actors.keys())}"
+            )
+
+    def dump_actors(self):
+        n = len(self.actors)
+        s = f"Number of Actors: {n}"
+        for actor in self.actors.values():
+            a = f"\n- {actor.name}"
+            s += indent(2, a)
+        return s
+
+    def dump_actor_types(self):
+        return "\n".join(list(actor_types.keys()))
+
+    def get_actor_user_info(self, name):
+        self.warn_user(
+            "Deprecation warning: The function 'get_actor_user_info' will soon be removed."
+            "Use my_actor.user_info instead, where 'my_actor' "
+            "should be replace by your actor object. "
+            "You can also access user input parameters directly, e.g. my_actor.attached_to=..."
+        )
+        actor = self.get_actor(name)
+        return actor.user_info
+
+    def add_actor(self, actor, name):
+        from .actors.filters import bind_filter_to_simulation
+
+        new_actor = None
+        if isinstance(actor, str):
+            if name is None:
+                fatal("You must provide a name for the actor.")
+            new_actor = self._create_actor(actor, name)
+        elif isinstance(actor, ActorBase):
+            new_actor = actor
+        else:
+            fatal(
+                "You need to either provide an actor type and name, or an actor object."
+            )
+
+        if new_actor.name in self.actors:
+            fatal(
+                f"The actor named {new_actor.name} already exists. "
+                f"Existing actor names are: {self.actors.keys()}"
+            )
+        self.actors[new_actor.name] = new_actor
+        self.actors[new_actor.name].simulation = self.simulation
+        if new_actor.filter is not None:
+            bind_filter_to_simulation(new_actor.filter, self.simulation)
+        # return the volume if it has not been passed as input, i.e. it was created here
+        if new_actor is not actor:
+            return new_actor
+
+    def find_actors(self, sub_str, case_sensitive=False):
+        # find all actors that contain this substring
+        actors = []
+        if not case_sensitive:
+            sub_str = sub_str.lower()
+        for actor in self.actors.values():
+            name = actor.name
+            if not case_sensitive:
+                name = name.lower()
+            if sub_str in name:
+                actors.append(actor)
+        return actors
+
+    def find_actors_by_type(self, type_name, sub_str=None, case_sensitive=False):
+        # find all actors of a given type
+        actors = []
+        if not case_sensitive and sub_str is not None:
+            sub_str = sub_str.lower()
+        for actor in self.actors.values():
+            if actor.type_name == type_name:
+                if sub_str is None:
+                    actors.append(actor)
+                else:
+                    name = actor.name
+                    if not case_sensitive:
+                        name = name.lower()
+                    if sub_str in name:
+                        actors.append(actor)
+        return actors
+
+    def find_actor_by_type(self, type_name, sub_str=None, case_sensitive=False):
+        actors = self.find_actors_by_type(type_name, sub_str, case_sensitive)
+        if len(actors) == 1:
+            return actors[0]
+        else:
+            fatal(f'Found {len(actors)} actors of type "{type_name}". Expected 1.')
+            return None
+
+    def remove_actor(self, name):
+        self.actors.pop(name)
+
+    def plan_merge(self, mode="as_configured"):
+        output_plans = []
+        for actor_name, actor in self.actors.items():
+            output_plans.extend(actor.plan_merge(mode=mode))
+        return output_plans
+
+    def _create_actor(self, actor_type, name):
+        cls = None
+        try:
+            cls = actor_types[actor_type]
+        except KeyError:
+            fatal(
+                f"Unknown actor type {actor_type}. "
+                f"Known types are: \n."
+                f"{self.dump_actor_types()}."
+            )
+        return cls(name=name, simulation=self.simulation)
+
+
+def _setter_hook_physics_list_name(self, physics_list_name):
+    if physics_list_name.startswith("G4EmDNAPhysics"):
+        fatal(
+            f"Global DNA EM physics lists are not supported in GATE. "
+            f"Received '{physics_list_name}'. "
+            f"Configure track-structure EM only per region, e.g. via Region.track_structure_em_physics, "
+            f"PhysicsManager.set_track_structure_em_physics(...), or VolumeBase.set_track_structure_em_physics(...)."
+        )
+    return physics_list_name
+
+
+def _setter_hook_user_limits_particles(self, particle_names):
+    if not isinstance(particle_names, (list, set, tuple)):
+        return list([particle_names])
+    else:
+        return particle_names
+
+
+class PhysicsManager(GateObject):
+    """
+    Everything related to the physics (lists, cuts, etc.) should be here.
+    """
+
+    user_info_defaults = {
+        "physics_list_name": (
+            "QGSP_BERT_EMV",
+            {
+                "doc": "Name of the Geant4 physics list. DNA EM physics must be configured per region, not as a global physics list.",
+                "setter_hook": _setter_hook_physics_list_name,
+            },
+        ),
+        "global_production_cuts": (
+            Box([("all", None)] + [(pname, None) for pname in cut_particle_names]),
+            {
+                "doc": "Dictionary containing the production cuts (range) for gamma, electron, positron, proton. Option 'all' overrides individual cuts."
+            },
+        ),
+        "apply_cuts": (
+            True,
+            {
+                "doc": "Flag to turn of cuts 'on the fly'. Still under development in Gate."
+            },
+        ),
+        "energy_range_min": (
+            None,
+            {
+                "doc": "Minimum energy for secondary particle production. If None, physics list default is used."
+            },
+        ),
+        "energy_range_max": (
+            None,
+            {
+                "doc": "Maximum energy for secondary particle production. If None, physics list default is used."
+            },
+        ),
+        "optical_properties_file": (
+            Path(os.path.dirname(__file__)) / "data" / "OpticalProperties.xml",
+            {
+                "doc": "Path to the xml file containing the optical material properties to be used by G4OpticalPhysics. "
+                "Default: file shipped with GATE.",
+                "is_input_file": True,
+            },
+        ),
+        "surface_properties_file": (
+            Path(os.path.dirname(__file__)) / "data" / "SurfaceProperties.xml",
+            {
+                "doc": "Path to the xml file containing the surface material properties to be used by "
+                "optical surface, i.e. G4LogicalBorderSurface."
+                f"The default file shipped with GATE located is in "
+                f"{Path(os.path.dirname(__file__)) / 'data' / 'SurfaceProperties.xml'}",
+                "is_input_file": True,
+            },
+        ),
+        "user_limits_particles": (
+            ["all_charged"],
+            {
+                "doc": "List of particles to which UserLimits, e.g. step limiter, are applied. Default: Step limiter "
+                "is applied to all charged particles (in accordance with G4 default).",
+                "setter_hook": _setter_hook_user_limits_particles,
+            },
+        ),
+        "em_parameters": (
+            Box(
+                [
+                    ("fluo", None),
+                    ("auger", None),
+                    ("auger_cascade", None),
+                    ("pixe", None),
+                    ("deexcitation_ignore_cut", None),
+                ]
+            ),
+            {"doc": "Switches on (True) or off (False) Geant4's EM parameters."},
+        ),
+        "em_switches_world": (
+            Box([("deex", None), ("auger", None), ("pixe", None)]),
+            {
+                "doc": "Switch on/off EM parameters in the world region.",
+                "expose_items": False,
+            },
+        ),
+        "special_physics_constructors": (
+            Box(
+                [
+                    (spc, False)
+                    for spc in PhysicsListBuilder.special_physics_constructor_classes
+                ]
+            ),
+            {
+                "doc": "Special physics constructors to be added to the physics list, e.g. G4Decay, G4OpticalPhysics. "
+            },
+        ),
+        "mean_energy_per_ion_pair": (
+            Box(),
+            {
+                "doc": "Dict of material_name:energy_value, such that: sim.physics_manager.mean_energy_per_ion_pair['IEC_PLASTIC'] = 5.0 * eV. "
+                "Mostly used for using acolinearity during annihilation in some materials"
+            },
+        ),
+        "material_ionisation_potential": (
+            Box(),
+            {
+                "doc": "Dict of material_name:energy_value, such that: sim.physics_manager.material_ionisation_potential['IEC_PLASTIC'] = 5.0 * eV. "
+            },
+        ),
+        # "processes_to_bias": (
+        #     Box(
+        #         [
+        #             ("all", None),
+        #             ("all_charged", None),
+        #             ("gamma", None),
+        #             ("electron", None),
+        #             ("positron", None),
+        #             ("proton", None),
+        #         ]
+        #     ),
+        #     {
+        #         "doc": "Define the process to bias (if wanted) on the different particle types."
+        #     },
+        # ),
+    }
+
+    def __init__(self, simulation, *args, **kwargs) -> None:
+        super().__init__(name="physics_manager", *args, **kwargs)
+
+        # Keep a pointer to the current simulation
+        self.simulation = simulation
+        self.physics_list_builder = PhysicsListBuilder(
+            simulation=self.simulation, name="PhysicsListBuilder"
+        )
+
+        # dictionary containing all the region objects
+        # key=region_name, value=region_object
+        self.regions = {}
+        # Dictionary to quickly find the region to which a volume is associated.
+        # This dictionary is updated by the region's associate_volume method.
+        # Do not update manually!
+        # key=volume_name, value=region=object
+        # NB: It is well-defined because each volume has only one region.
+        self.volumes_regions_lut = {}
+
+        # dictionary containing all the optical surface objects
+        self.optical_surfaces = {}
+
+    def reset(self):
+        self.__init__(self.simulation)
+
+    def to_dictionary(self):
+        d = super().to_dictionary()
+        d["regions"] = dict([(k, v.to_dictionary()) for k, v in self.regions.items()])
+        d["optical_surfaces"] = dict(
+            [(k, v.to_dictionary()) for k, v in self.optical_surfaces.items()]
+        )
+        return d
+
+    def from_dictionary(self, d):
+        self.reset()
+        super().from_dictionary(d)
+        for r in d["regions"].values():
+            region = self.add_region(r["user_info"]["name"])
+            region.from_dictionary(r)
+        for s in d["optical_surfaces"].values():
+            optical_surface = self.add_optical_surface(
+                s["user_info"]["volume_from"],
+                s["user_info"]["volume_to"],
+                s["user_info"]["g4_surface_name"],
+            )
+            optical_surface.from_dictionary(s)
+
+    def __str__(self):
+        s = ""
+        for k, v in self.user_info.items():
+            s += f"{k}: {v}\n"
+        return s
+
+    def __getstate__(self):
+        # if self.simulation.verbose_getstate:
+        #     self.warn_user("Getstate PhysicsManager")
+
+        # in the case of the PhysicsManager, we make a copy of super().__getstate__()
+        # rather than just using super().__getstate__() (which does not make a copy).
+        # Reason: physics_list_builder would become None also in the base process
+        dict_to_return = dict([(k, v) for k, v in super().__getstate__().items()])
+        dict_to_return["physics_list_builder"] = None
+        return dict_to_return
+
+    def __setstate__(self, d):
+        self.__dict__ = d
+        self.physics_list_builder = PhysicsListBuilder(
+            simulation=self.simulation, name="PhysicsListBuilder"
+        )
+
+    def _simulation_engine_closing(self):
+        """This function should be called from the simulation engine
+        when it is closing to make sure that G4 references are set to None.
+
+        """
+        # Region contain references to G4 objects, so they need to close
+        for r in self.regions.values():
+            r.close()
+
+    def dump_available_physics_lists(self):
+        return self.physics_list_builder.dump_info_physics_lists()
+
+    def dump_info_physics_lists(self):
+        return self.physics_list_builder.dump_info_physics_lists()
+
+    def dump_production_cuts(self):
+        s = "*** Production cuts for World: ***\n"
+        for k, v in self.user_info.global_production_cuts.items():
+            s += f"{k}: {v}\n"
+        if len(self.regions.keys()) > 0:
+            s += "*** Production cuts per regions ***\n"
+            for region in self.regions.values():
+                s += f"In region {region.name}:\n"
+                s += region.dump_production_cuts()
+        else:
+            s += "*** No cuts per region defined. ***\n"
+        return s
+
+    def dump_optical_surfaces(self):
+        """
+        Prints each volume's name and its associated surfaces' details (surface name and connected volumes)
+        from the `volume_surfaces` dictionary in a readable format.
+        """
+        s = "The PhysicsManager is storing the following optical surfaces:\n\n"
+        for surf in self.optical_surfaces.values():
+            s += str(surf)
+            s += "\n"
+        return s
+
+    @property
+    def enable_decay(self):
+        """Properties to quickly enable decay.
+
+        Note that setting enable_decay to False means that the physics list
+        default is used, i.e. it does not forcefully remove
+        G4DecayPhysics from the physics list.
+        """
+
+        switch1 = self.special_physics_constructors["G4DecayPhysics"]
+        switch2 = self.special_physics_constructors["G4RadioactiveDecayPhysics"]
+        if switch1 is True and switch2 is True:
+            return True
+        elif switch1 is False and switch2 is False:
+            return False
+        else:
+            fatal(
+                f"Inconsistent G4Decay constructors: G4DecayPhysics = {switch1}, G4RadioactiveDecayPhysics = {switch2}."
+            )
+
+    @enable_decay.setter
+    def enable_decay(self, value):
+        self.special_physics_constructors["G4DecayPhysics"] = value
+        self.special_physics_constructors["G4RadioactiveDecayPhysics"] = value
+
+    def add_optical_surface(self, volume_from, volume_to, g4_surface_name):
+        """
+        Creates an object of class OpticalSurface with surface info.
+
+        :param volume_from: Name of the first volume (str)
+
+        :param volume_to: Name of the second volume (str)
+
+        :param g4_surface_name: Name of the surface between volumes (str)
+        """
+
+        name = "optical_surface_" + volume_from + "_" + volume_to
+
+        # Throw an error if the optical surface already exists
+        if name in self.optical_surfaces:
+            fatal("An optical surface between these volumes already exists")
+
+        self.optical_surfaces[name] = OpticalSurface(
+            name=name,
+            simulation=self.simulation,
+            volume_from=volume_from,
+            volume_to=volume_to,
+            g4_surface_name=g4_surface_name,
+        )
+
+        return self.optical_surfaces[name]
+
+    def add_region(self, name):
+        if name in self.regions:
+            fatal("A region with this name already exists.")
+        self.regions[name] = Region(name=name, simulation=self.simulation)
+        return self.regions[name]
+
+    def _normalize_volume_name(self, volume):
+        if isinstance(volume, str):
+            return volume
+        try:
+            return volume.name
+        except AttributeError:
+            fatal(f"Expected a volume name or a volume object, but received: {volume}")
+
+    def find_region(self, volume_name):
+        return self.volumes_regions_lut.get(volume_name, None)
+
+    def find_or_create_region(self, volume_name):
+        if volume_name == self.simulation.world.name:
+            region_name = "DefaultRegionForTheWorld"
+        else:
+            region_name = volume_name + "_region"
+        if volume_name not in self.volumes_regions_lut:
+            region = self.add_region(region_name)
+            region.associate_volume(volume_name)
+        else:
+            region = self.volumes_regions_lut[volume_name]
+        return region
+
+    def get_biasing_particles_and_processes(self):
+        """Build a dictionary {particles:list[processes]} by collecting information
+        from all biasing actors present in the simulation.
+        """
+
+        charged_particles = {"e-", "e+", "proton"}
+        all_particles = charged_particles.union({"gamma"})
+
+        # create a dictionary with sets as entries (to ensure uniqueness)
+        particles_processes = dict([(p, set()) for p in all_particles])
+
+        for actor in self.simulation.actor_manager.actors.values():
+            if isinstance(actor, GenericBiasingActorBase):
+                particles = set()
+                if "all" in actor.particles:
+                    particles.update(all_particles)
+                elif "all_charged" in actor.particles:
+                    particles.update(charged_particles)
+                else:
+                    for particle in actor.particles:
+                        p_ = translate_particle_name_gate_to_geant4(particle)
+                        if p_ in all_particles:
+                            particles.add(p_)
+                        else:
+                            fatal(
+                                f"Biasing actor {actor.name} wants to apply a bias to particle '{p_}'. "
+                                f"This is not possible. Compatible particles are: {list(all_particles)}. "
+                            )
+                for p in particles:
+                    particles_processes[p].update(actor.processes)
+
+        # convert the dictionary entries back from set to list
+        return dict(
+            [
+                (particle, list(processes))
+                for particle, processes in particles_processes.items()
+            ]
+        )
+
+    # New name, more specific
+    def set_production_cut(self, volume_name, particle_name, value):
+        volume_name = self._normalize_volume_name(volume_name)
+        if volume_name == self.simulation.world.name:
+            self.global_production_cuts[particle_name] = value
+        else:
+            region = self.find_or_create_region(volume_name)
+            region.production_cuts[particle_name] = value
+
+    # set methods for the user_info parameters
+    # logic: every volume with user_infos must be associated
+    # with a region. If it does not yet have one, created it.
+    # Outlook: These setter methods might be linked to properties
+    # implemented in a future version of the Volume class
+    def set_max_step_size(self, volume_name, max_step_size):
+        volume_name = self._normalize_volume_name(volume_name)
+        region = self.find_or_create_region(volume_name)
+        region.user_limits["max_step_size"] = max_step_size
+
+    def set_max_track_length(self, volume_name, max_track_length):
+        volume_name = self._normalize_volume_name(volume_name)
+        region = self.find_or_create_region(volume_name)
+        region.user_limits["max_track_length"] = max_track_length
+
+    def set_min_ekine(self, volume_name, min_ekine):
+        volume_name = self._normalize_volume_name(volume_name)
+        region = self.find_or_create_region(volume_name)
+        region.user_limits["min_ekine"] = min_ekine
+
+    def set_max_time(self, volume_name, max_time):
+        volume_name = self._normalize_volume_name(volume_name)
+        region = self.find_or_create_region(volume_name)
+        region.user_limits["max_time"] = max_time
+
+    def set_min_range(self, volume_name, min_range):
+        volume_name = self._normalize_volume_name(volume_name)
+        region = self.find_or_create_region(volume_name)
+        region.user_limits["min_range"] = min_range
+
+    def set_track_structure_em_physics(self, volume_name, track_structure_em_physics):
+        volume_name = self._normalize_volume_name(volume_name)
+        region = self.find_or_create_region(volume_name)
+        region.track_structure_em_physics = track_structure_em_physics
+
+    def set_track_structure_em_physics_in_region(
+        self, region_name, track_structure_em_physics
+    ):
+        try:
+            region = self.regions[region_name]
+        except KeyError:
+            fatal(
+                f"Cannot set track-structure EM physics: region '{region_name}' does not exist."
+            )
+        region.track_structure_em_physics = track_structure_em_physics
+
+    def set_user_limits_particles(self, particle_names):
+        raise GateDeprecationError(
+            "The function set_user_limits_particles has been removed. Set the particle(s) directly via: \n"
+            "sim.physics_manager.user_limits_particles = XXX, \n"
+            "e.g.\n"
+            "sim.physics_manager.user_limits_particles = 'proton'\n"
+            "or \n"
+            "sim.physics_manager.user_limits_particles = ['gamma', 'electron']"
+        )
+        # if not isinstance(particle_names, (list, set, tuple)):
+        #     particle_names = list([particle_names])
+        # self.user_info.user_limits_particles = particle_names
+
+        # for pn in list(particle_names):
+        #     # try to get current value to check if particle_name is eligible
+        #     try:
+        #         _ = self.user_info.user_limits_particles[pn]
+        #     except KeyError:
+        #         fatal(
+        #             f"Found unknown particle name '{pn}' in set_user_limits_particles(). Eligible names are "
+        #             + ", ".join(list(self.user_info.user_limits_particles.keys()))
+        #             + "."
+        #         )
+        #     self.user_info.user_limits_particles[pn] = True
+
+    def resolve_and_validate_config(self, context=None):
+        # Freeze the Python-side configuration before any SimulationEngine is
+        # created. This phase may negotiate requests across managers and
+        # actors, but it must not instantiate Geant4 objects yet.
+        # Chemistry actors may request region-based track-structure EM physics on the
+        # volumes they are attached to. This must be resolved before the
+        # physics engine configures G4 EM parameters and registers the DNA
+        # activator.
+        track_structure_em_requests = {}
+        for actor in self.simulation.actor_manager.sorted_actors:
+            request = actor.get_track_structure_em_physics_request()
+            if request is None:
+                continue
+            volume_name, track_structure_em_physics = request
+            previous_request = track_structure_em_requests.get(volume_name)
+            if previous_request is not None:
+                previous_track_structure_em_physics, previous_actor_name = (
+                    previous_request
+                )
+                if previous_track_structure_em_physics != track_structure_em_physics:
+                    fatal(
+                        f"Conflicting track_structure_em_physics requests for volume '{volume_name}': "
+                        f"actor '{previous_actor_name}' requests '{previous_track_structure_em_physics}' "
+                        f"while actor '{actor.name}' requests '{track_structure_em_physics}'."
+                    )
+            track_structure_em_requests[volume_name] = (
+                track_structure_em_physics,
+                actor.name,
+            )
+
+        for volume_name, (
+            track_structure_em_physics,
+            _,
+        ) in track_structure_em_requests.items():
+            self.set_track_structure_em_physics(volume_name, track_structure_em_physics)
+
+        # Resolve all region-to-volume associations against the simulation-side
+        # volume registry during config handling so invalid references fail
+        # early, before any Geant4 initialization begins.
+        for region in self.regions.values():
+            region.resolve_and_validate_config(context=context)
+
+        if (
+            len(
+                set(r.name for r in self.regions.values()).difference(
+                    set(r.name for r in self.volumes_regions_lut.values())
+                )
+            )
+            > 0
+        ):
+            fatal(
+                "The PhysicsManager has regions not represented in the volumes_regions_lut. "
+            )
+
+
+def _setter_hook_chemistry_list_name(self, chemistry_list_name):
+    if chemistry_list_name is None:
+        return None
+    if chemistry_list_name == "default":
+        return self.inherited_user_info_defaults["chemistry_list_name"][0]
+    return chemistry_list_name
+
+
+def _setter_hook_confine_chemistry_to_volume(self, volume):
+    if volume is None:
+        return None
+    if isinstance(volume, str):
+        return volume
+    try:
+        return volume.name
+    except AttributeError:
+        fatal(
+            "chemistry_manager.confine_chemistry_to_volume must be either None, "
+            "a volume name, or a volume object."
+        )
+
+
+class ChemistryManager(GateObject):
+    """
+    Everything related to chemistry (Geant4-DNA) should be here.
+    """
+
+    alpha_warning_message = (
+        "Alpha-stage feature warning: GATE chemistry functionality is still under "
+        "active development. Interfaces, behavior, and outputs may change, and "
+        "results should be validated carefully before production use."
+    )
+
+    user_info_defaults = {
+        "chemistry_list_name": (
+            None,
+            {
+                "doc": "Name of the Geant4 chemistry list. If left unset, chemistry is disabled unless requested explicitly by a chemistry actor.",
+                "setter_hook": _setter_hook_chemistry_list_name,
+            },
+        ),
+        "time_step_model": (
+            "SBS",
+            {
+                "doc": "The Geant4 chemistry time-step model to use. ",
+                "allowed_values": ("SBS", "IRT", "IRT_syn"),
+            },
+        ),
+        "confine_chemistry_to_volume": (
+            None,
+            {
+                "doc": "If set, chemistry tracks starting outside this volume subtree are killed by a single global chemistry controller.",
+                "setter_hook": _setter_hook_confine_chemistry_to_volume,
+            },
+        ),
+    }
+
+    def __init__(self, simulation, *args, **kwargs) -> None:
+        kwargs["simulation"] = simulation
+        super().__init__(name="chemistry_manager", *args, **kwargs)
+
+        self.chemistry_list = ChemistryList(
+            name="chemistry_list",
+            simulation=simulation,
+        )
+        self._chemistry_world = None
+
+    def reset(self):
+        self.__init__(self.simulation)
+
+    @property
+    def chemistry_world(self):
+        return self._chemistry_world
+
+    @chemistry_world.setter
+    def chemistry_world(self, chemistry_world):
+        if chemistry_world is None:
+            self._chemistry_world = None
+            return
+        if not isinstance(chemistry_world, ChemistryWorld):
+            fatal(
+                "chemistry_manager.chemistry_world must be either None or a ChemistryWorld instance."
+            )
+        chemistry_world.simulation = self.simulation
+        self._chemistry_world = chemistry_world
+
+    def create_chemistry_world(
+        self, volume=None, translation=None, half_size=None, name="chemistry_world"
+    ):
+        if self.chemistry_world is not None:
+            fatal(
+                "A chemistry world is already defined for this simulation. "
+                "Set chemistry_manager.chemistry_world = None first if you want to replace it."
+            )
+        if volume is not None and (translation is not None or half_size is not None):
+            fatal(
+                "create_chemistry_world() expects either 'volume' or the pair "
+                "'translation'/'half_size', but not both."
+            )
+        if volume is None and (translation is None or half_size is None):
+            fatal(
+                "create_chemistry_world() expects either 'volume' or both "
+                "'translation' and 'half_size'."
+            )
+
+        chemistry_world = ChemistryWorld(name=name, simulation=self.simulation)
+        if volume is not None:
+            chemistry_world.set_volume(volume)
+        else:
+            chemistry_world.set_box(translation, half_size)
+        self.chemistry_world = chemistry_world
+        return chemistry_world
+
+    def to_dictionary(self):
+        d = super().to_dictionary()
+        d["chemistry_list"] = self.chemistry_list.to_dictionary()
+        d["chemistry_world"] = (
+            None
+            if self.chemistry_world is None
+            else self.chemistry_world.to_dictionary()
+        )
+        return d
+
+    def from_dictionary(self, d):
+        self.reset()
+        super().from_dictionary(d)
+        if "chemistry_list" in d:
+            self.chemistry_list.from_dictionary(d["chemistry_list"])
+        chemistry_world_dict = d.get("chemistry_world", None)
+        if chemistry_world_dict is not None:
+            chemistry_world = create_gate_object_from_dict(chemistry_world_dict)
+            if not isinstance(chemistry_world, ChemistryWorld):
+                fatal(
+                    f"Expected a serialized ChemistryWorld, but reconstructed {type(chemistry_world).__name__}."
+                )
+            chemistry_world.simulation = self.simulation
+            chemistry_world.from_dictionary(chemistry_world_dict)
+            self.chemistry_world = chemistry_world
+
+    def __str__(self):
+        s = ""
+        for k, v in self.user_info.items():
+            s += f"{k}: {v}\n"
+        return s
+
+    def __getstate__(self):
+        # if self.simulation.verbose_getstate:
+        #     self.warn_user("Getstate PhysicsManager")
+
+        return dict([(k, v) for k, v in super().__getstate__().items()])
+
+    def _simulation_engine_closing(self):
+        """This function should be called from the simulation engine
+        when it is closing to make sure that G4 references are set to None.
+
+        """
+        self.chemistry_list.close()
+        if self.chemistry_world is not None:
+            self.chemistry_world.close()
+
+    def check_chemistry_list_requests(self):
+        requested_chemistry_lists = set()
+
+        if self.chemistry_list_name not in (None, ""):
+            requested_chemistry_lists.add(self.chemistry_list_name)
+
+        for actor in self.simulation.actor_manager.sorted_actors:
+            if not actor.is_chemistry_actor:
+                continue
+            try:
+                actor_chemistry_list_name = actor.chemistry_list_name
+            except AttributeError:
+                fatal(
+                    f"Chemistry actor '{actor.name}' is missing required attribute "
+                    f"'chemistry_list_name'. Check that it inherits correctly from "
+                    f"ChemistryActorBase."
+                )
+            if actor_chemistry_list_name not in (None, ""):
+                requested_chemistry_lists.add(actor_chemistry_list_name)
+
+        # Chemistry must run with one coherent chemistry list. Actor-level and
+        # manager-level requests therefore participate in one uniqueness check.
+        if len(requested_chemistry_lists) > 1:
+            fatal(
+                f"Incompatible chemistry list requests were found: {sorted(requested_chemistry_lists)}. "
+                f"All chemistry actors and the ChemistryManager must request the same chemistry list."
+            )
+
+        if len(requested_chemistry_lists) == 1:
+            chemistry_list_name = next(iter(requested_chemistry_lists))
+        else:
+            chemistry_list_name = None
+
+        self.chemistry_list_name = chemistry_list_name
+        return chemistry_list_name
+
+    def simulation_uses_chemistry(self):
+        return (
+            self.simulation.actor_manager.has_chemistry_actors()
+            or self.chemistry_list_name not in (None, "")
+            or self.chemistry_list.has_customizations()
+            or self.chemistry_world is not None
+        )
+
+    def prepare_chemistry_list_if_needed(self):
+        chemistry_list_name = self.check_chemistry_list_requests()
+        self.chemistry_list.list_name = chemistry_list_name
+
+        if (
+            chemistry_list_name is None
+            and self.chemistry_list.has_customizations() is False
+        ):
+            return False
+        else:
+            return True
+
+
+class PostProcessingManager(GateObject):
+    """Everything related to post-processing. EXPERIMENTAL!"""
+
+    user_info_defaults = {
+        "auto_process": (
+            True,
+            {
+                "doc": "Should the post-processing automatically be started at the end of the simulation?"
+            },
+        ),
+    }
+
+    def __init__(self, simulation, *args, **kwargs):
+        super().__init__(
+            *args, name="post_processing_manager", simulation=simulation, **kwargs
+        )
+
+        self.finalizers = {}
+        self.post_processors = {}
+
+    def add_post_processor(self, post_processor):
+        try:
+            name = post_processor.name
+        except AttributeError:
+            fatal("Cannot retrieve the name of the post-processor.")
+        if name not in self.post_processors:
+            self.post_processors[name] = post_processor
+            # add finalizers to make sure the post-processor is shut down gracefully
+            # when the managers is garbage collected
+            self.finalizers[name] = weakref.finalize(
+                post_processor, post_processor.close
+            )
+        else:
+            fatal("A post-processor with this name has already been added. ")
+
+
+class VolumeManager(GateObject):
+    """
+    Store and manage a hierarchical list of geometrical volumes and associated materials.
+    This tree will be converted into Geant4 Solid/PhysicalVolume/LogicalVolumes
+    """
+
+    volume_types = {
+        "BoxVolume": BoxVolume,
+        "SphereVolume": SphereVolume,
+        "EllipsoidVolume": EllipsoidVolume,
+        "TrapVolume": TrapVolume,
+        "ImageVolume": ImageVolume,
+        "TubsVolume": TubsVolume,
+        "PolyhedraVolume": PolyhedraVolume,
+        "HexagonVolume": HexagonVolume,
+        "ConsVolume": ConsVolume,
+        "TrdVolume": TrdVolume,
+        "BooleanVolume": BooleanVolume,
+        "RepeatParametrisedVolume": RepeatParametrisedVolume,
+        "TesselatedVolume": TesselatedVolume,
+        "TetrahedralMeshVolume": TetrahedralMeshVolume,
+    }
+
+    def __init__(self, simulation, *args, **kwargs) -> None:
+        """
+        Class that store geometry description.
+        """
+        # force name to VolumeManager
+        kwargs["name"] = "VolumeManager"
+        kwargs["simulation"] = simulation
+        super().__init__(*args, **kwargs)
+
+        self.volume_tree_root = VolumeTreeRoot(
+            volume_manager=self
+        )  # abstract element used as common root for volume tree
+        m = g4_units.m
+
+        # default world volume
+        self.volumes = {}
+        self.volumes[__world_name__] = BoxVolume(
+            simulation=self.simulation,
+            name=__world_name__,
+            size=[3 * m, 3 * m, 3 * m],
+            material="G4_AIR",
+            mother=None,
+        )
+        # attach the world to the tree root
+        self.volumes[__world_name__].parent = self.volume_tree_root
+
+        self.parallel_world_volumes = {}
+
+        self._need_tree_update = True  # flag to store state of volume tree
+
+        # database of materials
+        self.material_database = MaterialDatabase()
+
+        # List of ImageBox solids
+        # They need to be init after the creation of OpenGL
+        # Store them to init them later
+        self.solid_with_texture_init = []
+
+        # fields
+        self.fields: dict[str, FieldBase] = {}
+
+    def reset(self):
+        self.__init__(self.simulation)
+
+    def __str__(self):
+        s = "**** Volume manager ****\n"
+        if len(self.parallel_world_volumes) > 0:
+            s += f"Number of parallel worlds: {len(self.parallel_world_volumes)}\n"
+            s += f"Names of the parallel worlds: {self.parallel_world_names}\n"
+        s += f"Number of volumes: {len(self.volumes)}\n"
+        s += "The volumes are organized in the following hierarchy:\n"
+        s += self.dump_volume_tree()
+        return s
+
+    def to_dictionary(self):
+        d = super().to_dictionary()
+        d["volumes"] = dict([(k, v.to_dictionary()) for k, v in self.volumes.items()])
+        d["parallel_world_volumes"] = list(self.parallel_world_volumes.keys())
+        d["fields"] = dict([(k, v.to_dictionary()) for k, v in self.fields.items()])
+        # Workaround: material database files are still managed outside the
+        # GateObject tree, so their filenames must be serialized explicitly.
+        d["material_database_filenames"] = list(self.material_database.filenames)
+        # Workaround: custom materials added programmatically are not yet
+        # represented by a dedicated GateObject/manager either, so persist
+        # their constructor arguments explicitly until the material handling is
+        # refactored into a proper config object model.
+        d["material_database_new_materials_nb_atoms"] = {
+            name: list(args)
+            for name, args in self.material_database.new_materials_nb_atoms.items()
+        }
+        d["material_database_new_materials_weights"] = {
+            name: list(args)
+            for name, args in self.material_database.new_materials_weights.items()
+        }
+        return d
+
+    def from_dictionary(self, d):
+        self.reset()
+        super().from_dictionary(d)
+        # Workaround: restore material database files explicitly because this
+        # state is not yet represented by a dedicated GateObject/manager.
+        for filename in d.get("material_database_filenames", []):
+            self.add_material_database(filename)
+        # Workaround: restore custom programmatically-added materials
+        # explicitly for split/reload workflows until material handling is
+        # refactored into a proper config object model.
+        for args in d.get("material_database_new_materials_nb_atoms", {}).values():
+            self.material_database.add_material_nb_atoms(*args)
+        for args in d.get("material_database_new_materials_weights", {}).values():
+            self.material_database.add_material_weights(*args)
+        # Restore fields before volumes so that volume references are valid
+        for k, v in d.get("fields", {}).items():
+            field_type = v["object_type"]
+            if field_type not in field_types:
+                fatal(
+                    f"Unknown field type '{field_type}'. "
+                    f"Known types are: {list(field_types.keys())}."
+                )
+            field = field_types[field_type](name=v["user_info"]["name"])
+            field.from_dictionary(v)
+            self.fields[field.name] = field
+        # Before, create the parrallel world volumes, so that they are available for the volumes to be created
+        for k in d["parallel_world_volumes"]:
+            self.add_parallel_world(k)
+        # First create all volumes
+        for k, v in d["volumes"].items():
+            # the world volume is always created in __init__
+            if v["user_info"]["name"] != self.world_volume.name:
+                self.add_volume(v["object_type"], name=v["user_info"]["name"])
+        # ... then process them to make sure that any reference
+        #  to a volume in the volumes dictionary is satisfied
+        for k, v in d["volumes"].items():
+            self.volumes[k].from_dictionary(v)
+        # and check that any reference to a volume in the volumes dictionary is satisfied (for RepeatParametrisedVolume)
+        for volume in self.volumes.values():
+            if hasattr(volume, "resolve_references"):
+                volume.resolve_references()
+
+    @property
+    def world_volume(self):
+        return self.volumes[__world_name__]
+
+    @property
+    def all_world_volumes(self):
+        """List of all world volumes, including the mass world volume."""
+        world_volumes = [self.world_volume]
+        world_volumes.extend(list(self.parallel_world_volumes.values()))
+        return world_volumes
+
+    @property
+    def volume_names(self):
+        return list(self.volumes.keys())
+
+    @property
+    def parallel_world_names(self):
+        return list(self.parallel_world_volumes.keys())
+
+    @property
+    def all_volume_names(self):
+        return self.volume_names + self.parallel_world_names
+
+    @property
+    def dynamic_volumes(self):
+        return [vol for vol in self.volumes.values() if vol.is_dynamic]
+
+    def resolve_and_validate_config(self, context=None):
+        # Resolve the volume tree explicitly during the configuration phase so
+        # invalid mother references and tree loops fail early instead of only
+        # when some later property access triggers a lazy update.
+        self.update_volume_tree()
+
+        dynamic_volumes = self.dynamic_volumes
+        for volume in dynamic_volumes:
+            volume.check_if_dynamic_params_match_run_timing_intervals()
+
+        if len(dynamic_volumes) > 0:
+            # For split-job workflows, dynamic changers must already exist at
+            # config-resolution time, because jobs_split() rewrites the child
+            # run-timing structure and serializes the resolved child
+            # simulation to JSON before execution. In ordinary single-job
+            # simulations this would not matter in the same way.
+            dynamic_geometry_actor = self.simulation.actor_manager.actors.get(
+                "dynamic_geometry_actor"
+            )
+            if dynamic_geometry_actor is None:
+                dynamic_geometry_actor = self.simulation.add_actor(
+                    "DynamicGeometryActor", "dynamic_geometry_actor"
+                )
+            dynamic_geometry_actor.priority = 0
+            dynamic_geometry_actor.changers = []
+            for volume in dynamic_volumes:
+                dynamic_geometry_actor.changers.extend(volume.create_changers())
+
+    def get_volume(self, volume_name):
+        try:
+            return self.volumes[volume_name]
+        except KeyError:
+            try:
+                return self.parallel_world_volumes[volume_name]
+            except KeyError:
+                fatal(
+                    f"Cannot find volume {volume_name}. "
+                    f"Volumes included in this simulation are: {self.volumes.keys()}"
+                )
+
+    def find_volumes(self, sub_str, case_sensitive=False):
+        # find all volumes that contains this substring
+        volumes = []
+        if not case_sensitive:
+            sub_str = sub_str.lower()
+        for actor in self.volumes.values():
+            name = actor.name
+            if not case_sensitive:
+                name = name.lower()
+            if sub_str in name:
+                volumes.append(actor)
+        return volumes
+
+    def update_volume_tree_if_needed(self):
+        if self._need_tree_update is True:
+            self.update_volume_tree()
+
+    def update_volume_tree(self):
+        for v in self.volumes.values():
+            if (
+                v not in self.parallel_world_volumes.values()
+                and v is not self.world_volume
+            ):
+                try:
+                    v._update_node()
+                except LoopError:
+                    fatal(
+                        f"There seems to be a loop in the volume tree involving volume {v.name}."
+                    )
+        self._need_tree_update = False
+
+    def add_volume(self, volume, name=None):
+        if isinstance(volume, str):
+            if name is None:
+                fatal("You must provide a name for the volume.")
+            new_volume = self.create_volume(volume, name)
+        elif isinstance(volume, VolumeBase):
+            new_volume = volume
+        else:
+            fatal(
+                "You need to either provide a volume type and name, or a volume object."
+            )
+
+        if new_volume.name in self.all_volume_names:
+            fatal(
+                f"The volume name {new_volume.name} already exists. Existing volume names are: {self.volumes.keys()}"
+            )
+        self.volumes[new_volume.name] = new_volume
+        self.volumes[new_volume.name].simulation = self.simulation
+        self._need_tree_update = True
+        # return the volume if it has not been passed as input, i.e. it was created here
+        if new_volume is not volume:
+            return new_volume
+
+    def remove_volume(self, volume_name):
+        self.volumes.pop(volume_name)
+
+    def create_volume(self, volume_type, name):
+        # check that another element with the same name does not already exist
+        volume_type_variants = [volume_type, volume_type + "Volume"]
+        for vt in volume_type_variants:
+            if vt in self.volume_types:
+                return self.volume_types[vt](name=name)
+        fatal(
+            f"Unknown volume type {volume_type}. Known types are: {list(self.volume_types.keys())}."
+        )
+
+    def add_parallel_world(self, name):
+        if name in self.all_volume_names:
+            fatal(
+                f"Cannot create the parallel world named {name} because it already exists."
+            )
+        # constructor needs self, i.e. the volume manager
+        self.parallel_world_volumes[name] = ParallelWorldVolume(name, self)
+        self._need_tree_update = True
+
+    def _simulation_engine_closing(self):
+        """
+        This function should be called from the simulation engine
+        when it is closing to make sure that G4 references are set to None.
+        """
+        self.material_database = None
+
+    def add_material_database(self, filename):
+        if filename in self.material_database.filenames:
+            fatal(f'Database "{filename}" already exist.')
+        self.material_database.read_from_file(filename)
+
+    def find_or_build_material(self, material):
+        return self.material_database.FindOrBuildMaterial(material)
+
+    def dump_volumes(self):
+        s = f"Number of volumes: {len(self.volumes)}"
+        for vol in self.volumes.values():
+            s += indent(2, f"\n{vol}")
+        return s
+
+    def print_volumes(self):
+        print(self.dump_volumes())
+
+    def dump_volume_tree(self):
+        """
+        Updates volume tree (if needed) and returns a string representation of the volume tree.
+        """
+        self.update_volume_tree_if_needed()
+        s = ""
+        for pre, _, node in RenderTree(self.volume_tree_root):
+            # FIXME: pre should be used directly but cannot be encoded correctly in Windows
+            s += len(pre) * " " + f"{node.name}\n"
+        return s
+
+    def get_volume_tree(self):
+        return self.volume_tree_root
+
+    def print_volume_tree(self):
+        print(self.dump_volume_tree())
+
+    def dump_volume_types(self):
+        s = ""
+        for vt in self.volume_types:
+            s += f"{vt} "
+        return s
+
+    def print_volume_types(self):
+        print(self.dump_volume_types())
+
+    def dump_material_database_names(self):
+        return list(self.material_database.filenames)
+
+    def print_material_database_names(self):
+        print(self.dump_material_database_names())
+
+
+def _setter_hook_verbose_level(self, verbose_level):
+    # print(f"_setter_hook_verbose_level to ", sim.log_handler_id, verbose_level)
+    if self.log_handler_id == -1:
+        # Remove the default logger configuration
+        logger.remove()
+    else:
+        # Remove the current logger configuration
+        try:
+            logger.remove(self.log_handler_id)
+        except:
+            pass
+
+    self.log_handler_id = logger.add(
+        sys.stdout,
+        colorize=True,
+        level=verbose_level,
+        format=("{level.icon}<level>{message}</level>"),  # Message formatting
+    )
+    return verbose_level
+
+
+def _setter_hook_progress_hook(simulation, value):
+    if hasattr(value, "_interval") and value._interval is not None:
+        simulation.user_info["progress_hook_interval"] = value._interval
+    return value
+
+
+def _setter_hook_simulation_dir(simulation, value):
+    return Path(value)
+
+
+def _setter_hook_output_dir(simulation, value):
+    if hasattr(simulation, "_output_dir_was_user_set"):
+        simulation._output_dir_was_user_set = True
+    return Path(value)
+
+
+class Simulation(GateObject):
+    """
+    Main class that store a simulation.
+    It contains:
+    - a set of global user parameters (SimulationUserInfo)
+    - user parameters for Volume, Source, Actors and Filters, Physics
+    - a list of g4 commands that will be set to the G4 engine after the initialisation
+
+    There is NO Geant4 engine here, it is only a set of parameters and options.
+    """
+
+    # hints for IDE
+    verbose_level: int
+    log_sink: str
+    verbose_close: bool
+    verbose_getstate: bool
+    running_verbose_level: int
+    g4_verbose_level: int
+    g4_verbose: bool
+    g4_verbose_level_tracking: int
+    visu: bool
+    visu_type: str
+    visu_filename: Optional[Path]
+    visu_verbose: bool
+    visu_commands: List[str]
+    visu_commands_vrml: List[str]
+    visu_commands_gdml: List[str]
+    check_volumes_overlap: bool
+    number_of_threads: int
+    force_multithread_mode: bool
+    random_engine: str
+    random_seed: Union[str, int]
+    run_timing_intervals: List[List[float]]
+    simulation_dir: Path
+    output_dir: Path
+    g4_commands_before_init: List[str]
+    g4_commands_after_init: List[str]
+    init_only: bool
+    progress_bar: bool
+    progress_hook: Optional[Callable]
+    progress_hook_interval: Optional[float]
+    dyn_geom_open_close: bool
+    dyn_geom_optimise: bool
+
+    default_simulation_filename = Path("simulation.json")
+    default_resolved_simulation_filename = Path("simulation_resolved.json")
+
+    user_info_defaults = {
+        "verbose_level": (
+            "INFO",
+            {
+                "doc": "Gate pre-run verbosity. "
+                "Will display more or fewer messages during initialization. ",
+                "setter_hook": _setter_hook_verbose_level,
+                "allowed_values": [
+                    "NONE",
+                    "DEBUG",
+                    "INFO",
+                    "WARNING",
+                    "CRITICAL",
+                    NONE,
+                    DEBUG,
+                    INFO,
+                    WARNING,
+                    CRITICAL,
+                ],
+            },
+        ),
+        "log_sink": (
+            None,
+            {
+                "doc": "Log sink. "
+                "If None, the default logger sys.stdout will be used. "
+                "If 'str', the logger output will be available after the simulation in sim.log_output"
+            },
+        ),
+        "verbose_close": (
+            False,
+            {"doc": "Switch on/off verbose output in close() methods."},
+        ),
+        "verbose_getstate": (
+            False,
+            {"doc": "Switch on/off verbose output in __getstate__() methods."},
+        ),
+        "running_verbose_level": (
+            0,
+            {
+                "doc": "Gate verbosity while the simulation is running.",
+                "allowed_values": (0, RUN, EVENT),
+            },
+        ),
+        "g4_verbose_level": (
+            1,
+            # For an unknown reason, when verbose_level == 0, there are some
+            # additional print after the G4RunManager destructor. So we default at 1
+            {
+                "doc": "Geant4 verbosity. With level 0, Geant4 is mostly silent. "
+                "Level 1 already gives quite a bit of verbose output. "
+                "Level 2 is very detailed and might affect performance. "
+            },
+        ),
+        "g4_verbose": (False, {"doc": "Switch on/off Geant4's verbose output."}),
+        "g4_verbose_level_tracking": (
+            -1,
+            {
+                "doc": "Activate verbose tracking in Geant4 "
+                "via G4 command '/tracking/verbose g4_verbose_level_tracking'."
+            },
+        ),
+        "visu": (
+            False,
+            {
+                "doc": "Activate visualization? "
+                "Note: Use low number of primaries if you activate visualization. "
+            },
+        ),
+        "visu_type": (
+            "vrml",
+            {
+                "doc": "The type of visualization to be used. "
+                "'qt' will start a Geant4 Qt interface. "
+                "The Geant4 visualisation commands can be adapted via the parameter visu_commands.",
+                "allowed_values": (
+                    "qt",
+                    "vrml",
+                    "gdml",
+                    "vrml_file_only",
+                    "gdml_file_only",
+                ),
+            },
+        ),
+        "visu_filename": (
+            None,
+            {
+                "doc": "Name of the file where visualization output is stored. Only applicable for vrml and gdml.",
+                "required_type": Path,
+            },
+        ),
+        "visu_verbose": (
+            False,
+            {
+                "doc": "Should verbose output be generated regarding the visualization?",
+            },
+        ),
+        "visu_commands": (
+            read_mac_file_to_commands("default_visu_commands_qt.mac"),
+            {
+                "doc": "Geant4 commands needed to handle the visualization. "
+                "By default, the Geant4 visualisation commands are the ones "
+                "provided in the file ``opengate/mac/default_visu_commands_qt.mac``. "
+                "Custom commands can be loaded via a .mac file, e.g.  "
+                "``sim.visu_commands = gate.utility.read_mac_file_to_commands('my_visu_commands.mac')``.",
+            },
+        ),
+        "visu_commands_vrml": (
+            read_mac_file_to_commands("default_visu_commands_vrml.mac"),
+            {
+                "doc": "Geant4 commands needed to handle the VRML visualization. "
+                "Only used for vrml-like visualization types. ",
+            },
+        ),
+        "visu_commands_gdml": (
+            read_mac_file_to_commands("default_visu_commands_gdml.mac"),
+            {
+                "doc": "Geant4 commands needed to handle the GDML visualization. "
+                "Only used for vrml-like visualization types. ",
+            },
+        ),
+        "check_volumes_overlap": (
+            True,
+            {
+                "doc": "If true, Gate will also check whether volumes overlap. "
+                "Note: Geant4 checks overlaps in any case."
+            },
+        ),
+        "number_of_threads": (
+            1,
+            {
+                "doc": "Number of threads on which the simulation will run. "
+                "Geant4's run manager will run in MT mode if more than 1 thread is requested."
+                "Requires Geant4 do be compiled with Multithread flag TRUE."
+            },
+        ),
+        "force_multithread_mode": (
+            False,
+            {
+                "doc": "Force Geant4 to run multihthreaded even if 'number_of_threads' = 1."
+            },
+        ),
+        "random_engine": (
+            "MixMaxRng",
+            {
+                "doc": "Name of the Geant4 random engine to be used. "
+                "MixMaxRng is recommended for multithreaded applications."
+            },
+        ),
+        "random_seed": (
+            "auto",
+            {
+                "doc": "Random seed to be used by the random engine. "
+                "Setting a specific value will make subsequent simulation runs to produce identical results."
+            },
+        ),
+        "current_random_seed": (
+            None,
+            {
+                "doc": "Concrete integer seed resolved from random_seed for the current configuration or most recent run.",
+                "read_only": True,
+            },
+        ),
+        "run_timing_intervals": (
+            [[0 * g4_units.second, 1 * g4_units.second]],
+            {
+                "doc": "A list of timing intervals provided as 2-element lists of begin and end values"
+            },
+        ),
+        "simulation_dir": (
+            Path("."),
+            {
+                "doc": "Structural root directory of the simulation. "
+                "This folder contains simulation.json, archived input files, "
+                "and, for split campaigns, the job000X subfolders.",
+                "setter_hook": _setter_hook_simulation_dir,
+                "required_type": Path,
+            },
+        ),
+        "output_dir": (
+            Path("output"),
+            {
+                "doc": "Directory to which any output is written, "
+                "unless an absolute path is provided for a specific output. "
+                "If relative, it is resolved relative to the simulation's simulation_dir.",
+                "setter_hook": _setter_hook_output_dir,
+                "required_type": Path,
+            },
+        ),
+        "store_json_archive": (
+            False,
+            {
+                "deprecated": "The user input parameter 'store_json_archive' has been removed. "
+                "Call sim.to_json_file(...) explicitly from the simulation script instead."
+            },
+        ),
+        "json_archive_filename": (
+            Path("simulation.json"),
+            {
+                "deprecated": "The user input parameter 'json_archive_filename' has been removed. "
+                "Pass filename=... explicitly to sim.to_json_file(...)."
+            },
+        ),
+        "store_input_files": (
+            False,
+            {
+                "deprecated": "The user input parameter 'store_input_files' has been removed. "
+                "Call sim.archive_input_files(...) explicitly from the simulation script instead."
+            },
+        ),
+        "g4_commands_before_init": (
+            [],
+            {
+                "doc": "Geant4 commands which will be called before the G4 runmanager has initialized the simulation.",
+                "required_type": str,
+            },
+        ),
+        "g4_commands_after_init": (
+            [],
+            {
+                "doc": "Geant4 commands which will be called after the G4 runmanager has initialized the simulation.",
+                "required_type": str,
+            },
+        ),
+        "init_only": (
+            False,
+            {
+                "doc": "Start G4 engine initialisation but do not start the simulation.",
+            },
+        ),
+        "progress_bar": (
+            False,
+            {
+                "doc": "Display a progress bar during the simulation",
+            },
+        ),
+        "progress_hook": (
+            None,
+            {
+                "doc": "Python function hook called periodically during simulation",
+                "setter_hook": _setter_hook_progress_hook,
+            },
+        ),
+        "progress_hook_interval": (
+            None,
+            {
+                "doc": "Interval in real wall-clock seconds between progress hook calls",
+            },
+        ),
+        "max_primaries_per_run": (
+            g4.GateSourceManager.GetPlatformMaxPrimariesPerRun(),
+            {
+                "doc": "Maximum number of primaries allowed in a single Geant4 BeamOn() call. "
+                "Defaults to the platform-dependent maximum of Geant4's G4int type. "
+                "Primarily useful for testing the overflow guard.",
+            },
+        ),
+        "dyn_geom_open_close": (
+            True,
+            {
+                "doc": "Warning, should be True. Only set it to false if you know what your are doing"
+            },
+        ),
+        "dyn_geom_optimise": (
+            True,
+            {"doc": "'Optimise' geometry when open/close during dynamic simulation. "},
+        ),
+    }
+
+    def __init__(self, name="simulation", **kwargs):
+        """
+        The main members are:
+        - managers of volumes, physics, sources, actors and filters
+        - the Geant4 objects will be only built during initialisation in SimulationEngine
+        """
+        # init logger
+        self.log_handler_id = -1
+        self.log_output = ""
+        _setter_hook_verbose_level(self, INFO)
+        self._output_dir_was_user_set = "output_dir" in kwargs
+
+        # The Simulation instance should not hold a reference to itself (cycle)
+        kwargs.pop("simulation", None)
+        super().__init__(name=name, **kwargs)
+
+        # list to store warning messages issued somewhere in the simulation
+        self._user_warnings = []
+
+        # main managers
+        self.volume_manager = VolumeManager(self)
+        self.source_manager = SourceManager(self)
+        self.actor_manager = ActorManager(self)
+        self.auxiliary_attributes = {}
+        self.physics_manager = PhysicsManager(self)
+        self.chemistry_manager = ChemistryManager(self)
+        self.filter_manager = FilterManager(self)
+
+        # hook functions
+        self.user_hook_after_init = None
+        self.user_hook_after_init_arg = None
+        self.user_hook_after_run = None
+        self.user_hook_log = None
+
+        self.expected_number_of_events = None
+        self._merge_coordinators = []
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        if hasattr(self, "auxiliary_attributes"):
+            for auxiliary_attribute in self.auxiliary_attributes.values():
+                auxiliary_attribute.simulation = self
+
+    def __str__(self):
+        s = (
+            f"Simulation name: {self.name} \n"
+            f"Geometry       : {self.volume_manager}\n"
+            f"Physics        : {self.physics_manager}\n"
+            f"Sources        : {self.source_manager}\n"
+            f"Actors         : {self.actor_manager}"
+        )
+        return s
+
+    def compare_with(self, other, mode="merge_target_compatibility"):
+        """Compare this simulation against another one and report differences.
+
+        The current scaffold supports the merge-target compatibility check used
+        by split-job merging. It deliberately compares only the structural
+        elements the merge workflow currently depends on.
+        """
+        differences = []
+
+        if not isinstance(other, Simulation):
+            return [
+                f"Object type mismatch: expected Simulation, received {type(other).__name__}."
+            ]
+
+        if mode == "merge_target_compatibility":
+            self_run_timing_intervals = [
+                [interval[0], interval[1]] for interval in self.run_timing_intervals
+            ]
+            other_run_timing_intervals = [
+                [interval[0], interval[1]] for interval in other.run_timing_intervals
+            ]
+            if self_run_timing_intervals != other_run_timing_intervals:
+                differences.append(
+                    "run_timing_intervals differ: "
+                    f"target={self_run_timing_intervals}, "
+                    f"reference={other_run_timing_intervals}."
+                )
+
+        actor_differences = self.actor_manager.compare_with(
+            other.actor_manager, mode=mode
+        )
+        differences.extend(actor_differences)
+        return differences
+
+    @property
+    def output(self):
+        raise GateDeprecationError(
+            "You can no longer (and do not need any longer) "
+            "access the simulation output via sim.output.\n"
+            "Use the original actor object directly."
+        )
+
+    @property
+    def use_multithread(self):
+        return self.number_of_threads > 1 or self.force_multithread_mode
+
+    @property
+    def world(self):
+        return self.volume_manager.world_volume
+
+    @property
+    def warnings(self):
+        return self._user_warnings
+
+    def reset_warnings(self):
+        self._user_warnings = []
+
+    def warn_user(self, message):
+        # We need this specific implementation because the Simulation does not hold a reference 'simulation',
+        # as required by the base class implementation of warn_user()
+        self._user_warnings.append(message)
+        super().warn_user(message)
+
+    def set_merge_coordinators(self, merge_coordinators):
+        self._merge_coordinators = list(merge_coordinators)
+
+    def add_merge_coordinator(self, merge_coordinator):
+        self._merge_coordinators.append(merge_coordinator)
+
+    def has_merge_coordinators(self):
+        return len(self._merge_coordinators) > 0
+
+    def to_dictionary(self):
+        d = super().to_dictionary()
+        d["volume_manager"] = self.volume_manager.to_dictionary()
+        d["physics_manager"] = self.physics_manager.to_dictionary()
+        d["chemistry_manager"] = self.chemistry_manager.to_dictionary()
+        d["actor_manager"] = self.actor_manager.to_dictionary()
+        d["source_manager"] = self.source_manager.to_dictionary()
+        d["auxiliary_attributes"] = dict(
+            [(k, v.to_dictionary()) for k, v in self.auxiliary_attributes.items()]
+        )
+        return d
+
+    def from_dictionary(self, d):
+        super().from_dictionary(d)
+        self.volume_manager.from_dictionary(d["volume_manager"])
+        self.physics_manager.from_dictionary(d["physics_manager"])
+        if "chemistry_manager" in d:
+            self.chemistry_manager.from_dictionary(d["chemistry_manager"])
+        self.actor_manager.from_dictionary(d["actor_manager"])
+        if "source_manager" in d:
+            self.source_manager.from_dictionary(d["source_manager"])
+        self.auxiliary_attributes = {}
+        for _, v in d.get("auxiliary_attributes", {}).items():
+            a = self.activate_auxiliary_attribute(
+                v["object_type"], name=v["user_info"]["name"]
+            )
+            a.from_dictionary(v)
+
+    def to_json_string(self):
+        return dumps_json(self.to_dictionary())
+
+    def _rewrite_input_paths_in_dict(self, dct, base_dir, path_mode):
+        """Rewrite serialized input-file paths relative to a JSON base directory.
+
+        ``path_mode="relative"`` stores input paths relative to the directory
+        containing simulation.json. ``path_mode="absolute"`` restores them
+        against that same directory when rehydrating a simulation from disk.
+        """
+
+        updated_dct = copy.deepcopy(dct)
+        base_dir = Path(base_dir).absolute()
+
+        def rewrite_input_path(path):
+            return _rewrite_path_against_reference(path, base_dir, path_mode)
+
+        for go_dict in find_all_gate_objects(updated_dct):
+            _, direct_input_file_names, dynamic_input_file_names = (
+                _collect_input_file_values_from_gate_object_dictionary(go_dict)
+            )
+            for ui_name in direct_input_file_names:
+                go_dict["user_info"][ui_name] = _apply_path_modifier_recursively(
+                    go_dict["user_info"][ui_name], rewrite_input_path
+                )
+            dynamic_params = go_dict["user_info"].get("dynamic_params") or {}
+            for parametrisation in dynamic_params.values():
+                for ui_name in dynamic_input_file_names:
+                    if ui_name in parametrisation:
+                        parametrisation[ui_name] = _apply_path_modifier_recursively(
+                            parametrisation[ui_name], rewrite_input_path
+                        )
+
+        # Workaround: material database files are not yet represented as proper
+        # GateObjects with declarative input-file metadata, so their serialized
+        # filenames must be rewritten explicitly here.
+        if (
+            "volume_manager" in updated_dct
+            and "material_database_filenames" in updated_dct["volume_manager"]
+        ):
+            updated_dct["volume_manager"]["material_database_filenames"] = [
+                _apply_path_modifier_recursively(filename, rewrite_input_path)
+                for filename in updated_dct["volume_manager"][
+                    "material_database_filenames"
+                ]
+            ]
+
+        return updated_dct
+
+    def to_json_file(self, directory=None, filename=None):
+        if filename is None:
+            filename = self.default_simulation_filename
+        directory = self.get_root_path(directory, is_file_or_directory="d")
+        d = self.to_dictionary()
+        d = self._rewrite_input_paths_in_dict(d, directory, path_mode="relative")
+        with open(directory / filename, "w") as f:
+            dump_json(d, f)
+
+    def write_simulation_json(self, directory=None, filename=None):
+        """Write the authored simulation configuration under the structural root.
+
+        This persists the current user-facing configuration without implying
+        that resolve_and_validate_config() has been run beforehand.
+        """
+        if filename is None:
+            filename = self.default_simulation_filename
+        self.to_json_file(directory=directory, filename=filename)
+        return self.get_root_path(directory, is_file_or_directory="d") / filename
+
+    def write_resolved_simulation_json(
+        self, directory=None, filename=None, context=None
+    ):
+        """Write the resolved simulation configuration under the structural root.
+
+        Note: resolve_and_validate_config() is intentionally allowed to mutate
+        the simulation configuration. This method makes that resolved state
+        explicit on disk instead of overwriting the authored simulation.json.
+        """
+        if filename is None:
+            filename = self.default_resolved_simulation_filename
+        self.resolve_and_validate_config(context=context)
+        directory = self.get_root_path(directory, is_file_or_directory="d")
+        d = self._get_resolved_simulation_dictionary()
+        d = self._rewrite_input_paths_in_dict(d, directory, path_mode="relative")
+        with open(directory / filename, "w") as f:
+            dump_json(d, f)
+        return self.get_root_path(directory, is_file_or_directory="d") / filename
+
+    def archive_input_files(
+        self,
+        directory=None,
+        dct=None,
+        link_files=False,
+        update_input_paths_in_dict=False,
+    ):
+        directory = self.get_root_path(directory, is_file_or_directory="d")
+        if dct is None:
+            dct = self.to_dictionary()
+        input_files = []
+        simulation_dir = Path(self.simulation_dir).absolute()
+        for go_dict in find_all_gate_objects(dct):
+            go_input_files, _, _ = (
+                _collect_input_file_values_from_gate_object_dictionary(go_dict)
+            )
+            for input_path in go_input_files:
+                path_obj = Path(input_path)
+                if path_obj.is_absolute() is False:
+                    path_obj = (simulation_dir / path_obj).absolute()
+                if path_obj.is_file() is True:
+                    input_files.append(path_obj)
+
+        # Workaround: material database files are not yet represented as proper
+        # GateObjects with declarative input-file metadata, so they must be added
+        # explicitly here. In the future, material database handling should be
+        # refactored into a GateObject/manager structure rather than the current
+        # file-based architecture.
+        if self.volume_manager.material_database is not None:
+            input_files.extend(
+                Path(filename)
+                for filename in self.volume_manager.material_database.filenames
+                if Path(filename).is_file()
+            )
+
+        # Post-process MetaImage headers so the actual payload file is copied, too.
+        extra_input_files = []
+        for input_file in input_files:
+            if input_file.suffix.lower() == ".mhd":
+                extra_input_files.extend(_find_metaimage_payload_files(input_file))
+        input_files.extend(extra_input_files)
+
+        # Copy or link each resolved file only once even if it is referenced several times.
+        unique_input_files = list(dict.fromkeys(Path(f).resolve() for f in input_files))
+        input_files_by_basename = {}
+        for input_file in unique_input_files:
+            input_files_by_basename.setdefault(input_file.name, []).append(input_file)
+        basename_collisions = {
+            basename: paths
+            for basename, paths in input_files_by_basename.items()
+            if len(paths) > 1
+        }
+        if basename_collisions:
+            collision_messages = []
+            for basename, paths in basename_collisions.items():
+                collision_messages.append(
+                    f"'{basename}' from: {', '.join(str(path) for path in paths)}"
+                )
+            fatal(
+                "Input-file archiving cannot continue because distinct input files "
+                "share the same basename and would collide in the archive folder. "
+                "Please rename the files or adjust the simulation inputs.\n"
+                + "\n".join(collision_messages)
+            )
+        for f in unique_input_files:
+            dest = directory / f.name
+            if link_files:
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
+                rel_target = os.path.relpath(f, directory)
+                try:
+                    dest.symlink_to(rel_target)
+                except OSError as e:
+                    fatal(
+                        f"Failed to create symlink from '{rel_target}' to '{dest}': {e}. "
+                        f"On Windows, creating symbolic links requires Developer Mode or Administrator privileges. "
+                        f"Use link_files=False to copy files instead."
+                    )
+            else:
+                shutil.copy2(f, directory)
+
+        if update_input_paths_in_dict is False:
+            return dct
+
+        updated_dct = copy.deepcopy(dct)
+        archive_path_map = {
+            Path(f).resolve(): (directory / Path(f).name).absolute()
+            for f in unique_input_files
+        }
+
+        def rewrite_archived_input_path(path):
+            source_path = Path(path)
+            if source_path.is_absolute() is False:
+                source_path = (simulation_dir / source_path).absolute()
+            rewritten_path = archive_path_map.get(
+                source_path.resolve(), (directory / Path(path).name).absolute()
+            )
+            return _rewrite_path_against_reference(
+                rewritten_path,
+                directory,
+                path_mode="relative",
+            )
+
+        for go_dict in find_all_gate_objects(updated_dct):
+            _, direct_input_file_names, dynamic_input_file_names = (
+                _collect_input_file_values_from_gate_object_dictionary(go_dict)
+            )
+            for ui_name in direct_input_file_names:
+                go_dict["user_info"][ui_name] = _apply_path_modifier_recursively(
+                    go_dict["user_info"][ui_name],
+                    rewrite_archived_input_path,
+                )
+            dynamic_params = go_dict["user_info"].get("dynamic_params") or {}
+            for parametrisation in dynamic_params.values():
+                for ui_name in dynamic_input_file_names:
+                    if ui_name in parametrisation:
+                        parametrisation[ui_name] = _apply_path_modifier_recursively(
+                            parametrisation[ui_name],
+                            rewrite_archived_input_path,
+                        )
+
+        # Workaround: material database files are not yet represented as proper
+        # GateObjects with declarative input-file metadata, so their serialized
+        # filenames must be rewritten explicitly here.
+        if (
+            "volume_manager" in updated_dct
+            and "material_database_filenames" in updated_dct["volume_manager"]
+        ):
+            updated_dct["volume_manager"]["material_database_filenames"] = [
+                _apply_path_modifier_recursively(filename, rewrite_archived_input_path)
+                for filename in updated_dct["volume_manager"][
+                    "material_database_filenames"
+                ]
+            ]
+
+        return updated_dct
+
+    def copy_input_files(self, directory=None, dct=None, link_files=False):
+        warnings.warn(
+            "Simulation.copy_input_files() is deprecated. "
+            "Use Simulation.archive_input_files(...) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.archive_input_files(directory=directory, dct=dct, link_files=link_files)
+
+    def from_json_string(self, json_string):
+        self.from_dictionary(loads_json(json_string))
+
+    def from_json_file(self, path):
+        path = Path(path).resolve()
+        with open(path, "r") as f:
+            d = load_json(f)
+        d = self._rewrite_input_paths_in_dict(d, path.parent, path_mode="absolute")
+        self.from_dictionary(d)
+        serialized_output_dir = d.get("user_info", {}).get("output_dir", Path("output"))
+        self._output_dir_was_user_set = Path(serialized_output_dir) != Path(".")
+        if Path(self.simulation_dir).is_absolute():
+            self.simulation_dir = Path(self.simulation_dir)
+        else:
+            self.simulation_dir = (path.parent / self.simulation_dir).resolve()
+
+    def get_root_path(self, path=None, is_file_or_directory="file", suffix=None):
+        if path is None:
+            p_out = Path(self.simulation_dir)
+        else:
+            p = Path(path)
+            if not p.is_absolute():
+                p_out = Path(self.simulation_dir) / p
+            else:
+                p_out = p
+
+        if suffix is not None:
+            p_out = insert_suffix_before_extension(p_out, suffix)
+
+        if is_file_or_directory in ["file", "File", "f"]:
+            n = len(p_out.parts) - 1
+        elif is_file_or_directory in ["dir", "Dir", "directory", "d"]:
+            n = len(p_out.parts)
+        if len(p_out.parts) > 0 and n > 0:
+            directory = Path(p_out.parts[0])
+            for i in range(n - 1):
+                directory /= p_out.parts[i + 1]
+            ensure_directory_exists(directory)
+
+        return p_out.absolute().resolve()
+
+    def get_output_path(self, path=None, is_file_or_directory="file", suffix=None):
+        output_root_dir = Path(self.output_dir)
+        if not output_root_dir.is_absolute():
+            output_root_dir = (Path(self.simulation_dir) / output_root_dir).resolve()
+
+        if path is None:
+            # no input -> return global output directory
+            p_out = output_root_dir
+        else:
+            # make sure type is Path
+            p = Path(path)
+            if not p.is_absolute():
+                # prepend the global output dir if p is relative
+                p_out = output_root_dir / p
+            else:
+                # or just keep it
+                p_out = p
+
+        if suffix is not None:
+            p_out = insert_suffix_before_extension(p_out, suffix)
+
+        # Make sure the directory exists
+        if is_file_or_directory in ["file", "File", "f"]:
+            n = len(p_out.parts) - 1  # last item is the filename
+        elif is_file_or_directory in ["dir", "Dir", "directory", "d"]:
+            n = len(p_out.parts)  # all items are part of the directory
+        if len(p_out.parts) > 0 and n > 0:
+            directory = Path(p_out.parts[0])
+            for i in range(n - 1):
+                directory /= p_out.parts[i + 1]
+            ensure_directory_exists(directory)
+
+        return p_out.absolute().resolve()
+
+    def add_g4_command_after_init(self, command):
+        raise GateDeprecationError("Use sim.g4_commands_after_init.append(COMMAND)")
+
+    def add_g4_command_before_init(self, command):
+        raise GateDeprecationError("Use sim.g4_commands_before_init.append(COMMAND)")
+
+    # FIXME: will we become obsolete when refactoring the sources
+    def get_source_user_info(self, name):
+        return self.source_manager.get_source(name)
+
+    def get_actor_user_info(self, name):
+        s = self.actor_manager.get_actor_user_info(name)
+        return s
+
+    def add_volume(self, volume, name=None):
+        return self.volume_manager.add_volume(volume, name)
+
+    # call this add optical surface, from_volume, to_volume,
+    def add_surface(self, volume_1, volume_2, surface_name):
+        return self.physics_manager.add_surface(volume_1, volume_2, surface_name)
+
+    def add_parallel_world(self, name):
+        self.volume_manager.add_parallel_world(name)
+
+    def add_source(self, source_type, name):
+        return self.source_manager.add_source(source_type, name)
+
+    def add_actor(self, actor_type, name):
+        return self.actor_manager.add_actor(actor_type, name)
+
+    def activate_auxiliary_attribute(self, attribute_type, name):
+        """
+        Activate a simulation-level runtime attribute.
+
+        Auxiliary attributes are named runtime attributes that may be consumed
+        from ROOT-backed actors, generic filters, or other C++ runtime
+        components. Some attributes are getter-only; others additionally use
+        Geant4 hooks and optional per-track storage.
+        """
+        if attribute_type in (
+            "ProcessDefinedStepInVolumeAttribute",
+            "LastProcessDefinedStepInVolumeAttribute",
+        ):
+            legacy_name = (
+                "ProcessDefinedStepInVolumeAttributeLegacy"
+                if attribute_type == "ProcessDefinedStepInVolumeAttribute"
+                else "LastProcessDefinedStepInVolumeAttributeLegacy"
+            )
+            warning(
+                f"{legacy_name} has been replaced by the auxiliary attribute "
+                f"{attribute_type} and will be deprecated soon."
+            )
+        return self._activate_auxiliary_attribute(attribute_type, name)
+
+    def _activate_auxiliary_attribute(self, attribute_type, name):
+        if name is None:
+            fatal("You must provide a name for the auxiliary attribute.")
+
+        if isinstance(attribute_type, str):
+            try:
+                cls = auxiliary_attribute_types[attribute_type]
+            except KeyError:
+                fatal(
+                    f"Unknown auxiliary attribute type {attribute_type}. "
+                    f"Known types are: {list(auxiliary_attribute_types.keys())}."
+                )
+            new_attribute = cls(name=name, simulation=self)
+        elif isinstance(attribute_type, AuxiliaryAttributeBase):
+            new_attribute = attribute_type
+        else:
+            fatal(
+                "You need to either provide an auxiliary attribute type and name, "
+                "or an auxiliary attribute object."
+            )
+
+        if new_attribute.name in self.auxiliary_attributes:
+            fatal(
+                f"The auxiliary attribute named {new_attribute.name} already exists. "
+                f"Existing auxiliary attribute names are: "
+                f"{self.auxiliary_attributes.keys()}"
+            )
+
+        digi_attribute_names = (
+            g4.GateDigiAttributeManager.GetInstance().GetAvailableDigiAttributeNames()
+        )
+        if new_attribute.name in digi_attribute_names:
+            fatal(
+                f"The auxiliary attribute name '{new_attribute.name}' collides "
+                "with an existing DigiAttribute name. Auxiliary attribute names "
+                "are also output/DigiAttribute names and must be unique."
+            )
+
+        self.auxiliary_attributes[new_attribute.name] = new_attribute
+        new_attribute.simulation = self
+        if new_attribute is not attribute_type:
+            return new_attribute
+
+    def initialize_auxiliary_attributes(self):
+        """
+        Initialize all activated auxiliary attributes before engine runtime.
+
+        This is the moment when Python-side configuration is pushed to the C++
+        objects, optional DigiAttribute exposure is declared, and the
+        auxiliary-attribute registry becomes ready for lookup by filters or
+        other consumers.
+        """
+        for attribute in self.auxiliary_attributes.values():
+            attribute.simulation = self
+            attribute.initialize()
+
+    def get_actor(self, name):
+        return self.actor_manager.get_actor(name)
+
+    def plan_merge(self, mode="as_configured"):
+        return self.actor_manager.plan_merge(mode=mode)
+
+    def execute_merge(self):
+        for merge_coordinator in self._merge_coordinators:
+            merge_coordinator.execute_merge()
+
+    def finalize_merge(self):
+        for merge_coordinator in self._merge_coordinators:
+            merge_coordinator.finalize_merge()
+
+    def find_actors(self, sub_str, case_sensitive=False):
+        return self.actor_manager.find_actors(sub_str, case_sensitive)
+
+    def _add_filter(self, filter_type, name):
+        return self.filter_manager.add_filter(filter_type, name)
+
+    def add_filter(self, filter_type, name):
+        fatal(f"add_filter is deprecated, use my_actor.filter = my_filter")
+
+    @property
+    def multithreaded(self):
+        return self.number_of_threads > 1 or self.force_multithread_mode
+
+    def initialize_logger(self):
+        original_stdout = sys.stdout
+        self.log_output = io.StringIO()
+        if self.log_sink == "str":
+            sys.stdout = self.log_output
+        # reinstall the logger (for subprocesses)
+        self.verbose_level = self.verbose_level
+        return original_stdout
+
+    def _is_split_child_simulation_context(self):
+        try:
+            return (self.simulation_dir / "job_metadata.json").exists()
+        except Exception:
+            return False
+
+    def _get_activity_based_source_names(self):
+        source_names = []
+        for source in self.source_manager.sources.values():
+            try:
+                if source.activity is not None and float(source.activity) > 0:
+                    source_names.append(source.name)
+            except Exception:
+                continue
+        return source_names
+
+    def warn_if_multithreaded_activity_sources_present(self):
+        activity_source_names = self._get_activity_based_source_names()
+        if len(activity_source_names) == 0:
+            return
+
+        names = ", ".join(activity_source_names)
+        if self.number_of_threads > 1:
+            self.warn_user(
+                "\n"
+                "===+++===+++===+++===+++===+++===+++===+++===+++===\n"
+                "===+++===+++ MULTITHREAD WARNING +++===+++===+++===\n"
+                "===+++===+++===+++===+++===+++===+++===+++===+++===\n"
+                "\n"
+                "The definition of source.activity has changed!"
+                "\n"
+                "OpenGATE now interprets source.activity as the "
+                "total source activity "
+                "\n"
+                "and scales it internally for multithreaded runs. "
+                "\n"
+                "Do NOT divide activity manually by the "
+                "number of threads!"
+                "\n"
+                "Activity-based sources detected in this simulation: "
+                f"{names}."
+                "\n"
+                "===+++===+++===+++===+++===+++===+++===+++===+++===\n"
+                "\n"
+            )
+
+    def resolve_and_validate_config(self, context=None):
+        # Keep this phase limited to Python-side configuration resolution and
+        # negotiation before runtime initialization. It may tie managers and
+        # actors together, but it must not create any Geant4 objects yet.
+        assert_run_timing(self.run_timing_intervals)
+        # Resolve the user-facing seed specification into the concrete seed for
+        # this resolved configuration. Ordinary runs consume it directly, while
+        # split preparation freezes it into the campaign before deriving one
+        # deterministic child seed per job.
+        if self.random_seed == "auto":
+            self.user_info["current_random_seed"] = random.randrange(sys.maxsize)
+        else:
+            self.user_info["current_random_seed"] = int(self.random_seed)
+        if self._output_dir_was_user_set is False and Path(self.output_dir) == Path(
+            "."
+        ):
+            self.warn_user(
+                "This simulation still uses the historical implicit output_dir='.'. "
+                "The recommended default is output_dir='output'. If you rely on the "
+                "current-directory behavior, please set sim.output_dir explicitly."
+            )
+        self.physics_manager.resolve_and_validate_config(context=context)
+        self.initialize_source_before_g4_engine()
+        self.volume_manager.resolve_and_validate_config(context=context)
+        self.source_manager.resolve_and_validate_config(context=context)
+        self.actor_manager.resolve_and_validate_config(context=context)
+        self.filter_manager.resolve_and_validate_config(context=context)
+
+    def _run_simulation_engine(self, start_new_process):
+        """Method that creates a simulation engine in a context (with ...) and runs a simulation.
+        Args:
+            start_new_process (bool, optional): A flag passed to the engine
+                so it knows if it is running in a subprocess.
+        Returns:
+            obj:SimulationOutput : The output of the simulation run.
+        """
+        self.resolve_and_validate_config()
+        with SimulationEngine(self) as se:
+            se.new_process = start_new_process
+            se.init_only = self.init_only
+            output = se.run_engine()
+        return output
+
+    def run(
+        self,
+        start_new_process=False,
+        number_of_jobs=None,
+        wait_for_result=True,
+        campaign_dir=None,
+        split_policy="split_in_time_total",
+        merge_after_run=True,
+        cleanup_after_run=False,
+        poll_interval=1.0,
+        timeout=None,
+    ):
+        # if windows and MT -> fail
+        if os.name == "nt" and self.multithreaded:
+            fatal(
+                "Error, the multi-thread option is not available for Windows now. "
+                "Run the simulation with one thread."
+            )
+
+        if number_of_jobs is not None:
+            try:
+                number_of_jobs = int(number_of_jobs)
+            except (TypeError, ValueError) as error:
+                fatal(
+                    f"Simulation.run(number_of_jobs=...) expects an integer or None. "
+                    f"Received: {number_of_jobs}"
+                )
+
+            if number_of_jobs < 1:
+                fatal(
+                    f"Simulation.run(number_of_jobs=...) requires number_of_jobs >= 1. "
+                    f"Received: {number_of_jobs}"
+                )
+
+            if number_of_jobs == 1:
+                start_new_process = True
+            else:
+                from .jobs import SplitRunMergeController
+
+                if start_new_process is True:
+                    fatal(
+                        "Simulation.run() received both start_new_process=True and "
+                        "number_of_jobs>1. Split runs are already process-managed "
+                        "through SplitRunMergeController/local_pool."
+                    )
+
+                split_run_controller = SplitRunMergeController(
+                    simulation=self,
+                    campaign_dir=campaign_dir,
+                    split_policy=split_policy,
+                    backend="local_pool",
+                    merge=merge_after_run,
+                    cleanup=cleanup_after_run,
+                )
+                split_run_controller.execute(
+                    number_of_jobs=number_of_jobs,
+                    wait_for_result=wait_for_result,
+                    poll_interval=poll_interval,
+                    timeout=timeout,
+                )
+                return split_run_controller
+
+        if self._is_split_child_simulation_context() is False:
+            self.warn_if_multithreaded_activity_sources_present()
+
+        # prepare the subprocess
+        if start_new_process is True:
+            """Important: put:
+                if __name__ == '__main__':
+                at the beginning of the script
+            https://britishgeologicalsurvey.github.io/science/python-forking-vs-spawn/
+            """
+
+            logger.info("Dispatching simulation to subprocess ...")
+            output = dispatch_to_subprocess(self._run_simulation_engine, True)
+
+            # Recover output from unpickled actors coming from the subprocess queue
+            for actor in self.actor_manager.actors.values():
+                actor.recover_user_output(output.get_actor(actor.name))
+
+            # FIXME: temporary workaround to copy from output the additional
+            # information of the source (such as fTotalSkippedEvents)
+            for source in self.source_manager.sources.values():
+                # WARNING: when multithread, the sources are stored in
+                # simulation_output.sources_by_thread
+                # The sources of thread=0 are also available in simulation_output.sources
+                # and they are retrieved here by get_source
+                try:
+                    s = output.get_source(source.name)
+                except:
+                    continue
+                source.recover_user_output(s)
+
+        else:
+            # Nothing special to do if the simulation engine ran in the native python process
+            # because everything is already in place.
+            output = self._run_simulation_engine(False)
+
+        # replace warnings by the one of the subprocess
+        self._user_warnings = output.warnings
+
+        # save the log output
+        self.log_output = output.log_output
+
+        # FIXME workaround
+        self.expected_number_of_events = output.expected_number_of_events
+
+        # store the hook log
+        self.user_hook_log = output.user_hook_log
+        self.user_info["current_random_seed"] = output.current_random_seed
+
+        # FIXME: MaterialDatabase should become a Manager/Engine with close mechanism
+        if self.volume_manager.material_database is None:
+            self.volume_manager.material_database = MaterialDatabase()
+
+        # print the warnings (if the logger level is ok)
+        if log_level(self.log_handler_id) < WARNING:
+            if len(self.warnings) > 0:
+                if len(self.warnings) == 1:
+                    warning(f"One warning occurred in this simulation:")
+                else:
+                    warning(
+                        f"{len(self.warnings)} warnings occurred in this simulation:"
+                    )
+                for i, w in enumerate(self.warnings):
+                    warning(f"({i+1}) {w}")
+
+        # For all biasing operators inheriting from G4VBiasingOperator,
+        # we need to clean the global static variable "fOperators" once everything is done
+        #  to be able to start another simulation. This should be only once,
+        # and for any one of the operators, we choose GateGammaFreeFlightOptrActor
+        # but this cleans for all. Trust me, bro.
+        g4.GateGammaFreeFlightOptrActor.ClearOperators()
+
+    def voxelize_geometry(
+        self,
+        extent="auto",
+        spacing=(3, 3, 3),
+        margin=0,
+        filename=None,
+        return_path=False,
+    ):
+        return voxelize_geometry(self, extent, spacing, margin, filename, return_path)
+
+    def initialize_source_before_g4_engine(self):
+        """
+        Some sources need to perform computation once everything is defined in user_info, but *before* the
+        initialization of the G4 engine starts. This can be done via this function.
+        """
+        self.source_manager.initialize_before_g4_engine()
+
+
+def create_sim_from_json(path):
+    sim = Simulation()
+    sim.from_json_file(path)
+    return sim
+
+
+process_cls(PhysicsManager)
+process_cls(ChemistryManager)
+process_cls(VolumeManager)
+process_cls(ActorManager)
+process_cls(PostProcessingManager)
+process_cls(Simulation)
+process_cls(SourceManager)

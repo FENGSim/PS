@@ -1,0 +1,37 @@
+/* --------------------------------------------------
+   Copyright (C): OpenGATE Collaboration
+   This software is distributed under the terms
+   of the GNU Lesser General  Public Licence (LGPL)
+   See LICENSE.md for further details
+   -------------------------------------------------- */
+
+#ifndef GateRepeatParameterisation_h
+#define GateRepeatParameterisation_h
+
+#include <G4VPVParameterisation.hh>
+#include <G4VPhysicalVolume.hh>
+#include <pybind11/pybind11.h>
+
+namespace py = pybind11;
+
+class GateRepeatParameterisation : public G4VPVParameterisation {
+
+public:
+  void SetUserInfo(py::dict &user_info);
+
+  virtual void ComputeTransformation(const G4int no,
+                                     G4VPhysicalVolume *currentPV) const;
+
+  G4ThreeVector fStart;
+  G4ThreeVector fTranslation;
+  G4RotationMatrix fRotation;
+  G4RotationMatrix *fRotationP;
+  G4ThreeVector fOffset;
+  int fNbOffset;
+  int fSx;
+  int fSy;
+  int fSz;
+  std::vector<G4ThreeVector> fTranslations;
+};
+
+#endif // GateRepeatParameterisation_h

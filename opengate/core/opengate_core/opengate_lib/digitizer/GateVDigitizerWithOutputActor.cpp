@@ -1,0 +1,138 @@
+/* --------------------------------------------------
+   Copyright (C): OpenGATE Collaboration
+   This software is distributed under the terms
+   of the GNU Lesser General  Public Licence (LGPL)
+   See LICENSE.md for further details
+   -------------------------------------------------- */
+
+#include "GateVDigitizerWithOutputActor.h"
+#include "../GateHelpersDict.h"
+#include "GateDigiCollectionManager.h"
+
+GateVDigitizerWithOutputActor::GateVDigitizerWithOutputActor(
+    py::dict &user_info, bool MT_ready)
+    : GateVActor(user_info, MT_ready) {
+
+  // actions
+  fActions.insert("StartSimulationAction");
+  fActions.insert("BeginOfRunAction");
+  fActions.insert("BeginOfEventAction");
+  fActions.insert("EndOfRunAction");
+  fActions.insert("EndOfSimulationWorkerAction");
+  fActions.insert("EndSimulationAction");
+
+  // init
+  fOutputDigiCollection = nullptr;
+  fInputDigiCollection = nullptr;
+  fInitializeRootTupleForMasterFlag = true;
+  fClearEveryNEvents = 100000;
+}
+
+GateVDigitizerWithOutputActor::~GateVDigitizerWithOutputActor() = default;
+
+// Called at initialisation
+void GateVDigitizerWithOutputActor::InitializeCpp() {
+  GateVActor::InitializeCpp();
+}
+
+// get user input parameters from python side
+void GateVDigitizerWithOutputActor::InitializeUserInfo(py::dict &user_info) {
+  GateVActor::InitializeUserInfo(user_info);
+  // options for input
+  fInputDigiCollectionName = DictGetStr(user_info, "input_digi_collection");
+
+  // options for output
+  fOutputDigiCollectionName = DictGetStr(user_info, "name");
+  fUserSkipDigiAttributeNames = DictGetVecStr(user_info, "skip_attributes");
+  fClearEveryNEvents = DictGetInt(user_info, "clear_every");
+}
+
+void GateVDigitizerWithOutputActor::StartSimulationAction() {
+  // FIXME: This method currently bundles several responsibilities in one block:
+  // resolving the input digi collection, creating/configuring the output
+  // collection, initializing output attributes, and preparing ROOT tuple
+  // creation. That makes inheritance awkward: simple digitizers can reuse the
+  // method, while more specialized ones often have to reimplement it almost
+  // entirely. Refactor toward smaller template-method style hooks so derived
+  // classes can override only the part they actually specialize.
+  // Get the input hits collection
+  auto *hcm = GateDigiCollectionManager::GetInstance();
+  fInputDigiCollection = hcm->GetDigiCollection(fInputDigiCollectionName);
+
+  // Create the list of output attributes
+  fOutputDigiCollection = hcm->NewDigiCollection(fOutputDigiCollectionName);
+  std::string outputPath;
+  if (!GetWriteToDisk(fOutputNameRoot)) {
+    outputPath = "";
+  } else {
+    outputPath = GetOutputPath(fOutputNameRoot);
+  }
+  fOutputDigiCollection->SetFilenameAndInitRoot(outputPath);
+  fOutputDigiCollection->InitDigiAttributesFromCopy(
+      fInputDigiCollection, fUserSkipDigiAttributeNames);
+
+  if (fInitializeRootTupleForMasterFlag) {
+    fOutputDigiCollection->RootInitializeTupleForMaster();
+    AddOutputTreeInfo(fOutputNameRoot, fOutputDigiCollection);
+  }
+}
+
+void GateVDigitizerWithOutputActor::BeginOfRunAction(const G4Run *run) {
+  if (run->GetRunID() == 0)
+    DigitInitializeNoParam();
+}
+
+void GateVDigitizerWithOutputActor::DigitInitializeNoParam() {
+  std::vector<std::string> fake;
+  DigitInitialize(fake);
+}
+
+void GateVDigitizerWithOutputActor::DigitInitialize(
+    const std::vector<std::string> &attributes_not_in_filler) {
+  fOutputDigiCollection->RootInitializeTupleForWorker();
+
+  // Init a Filler of all attributes except edep,
+  // pos and time that will be set explicitly
+  auto names = fOutputDigiCollection->GetDigiAttributeNames();
+  for (auto &name : attributes_not_in_filler)
+    names.erase(name);
+
+  // Get thread local variables
+  auto &l = fThreadLocalVDigitizerData.Get();
+
+  // Create Filler of all remaining attributes (except the required ones)
+  l.fDigiAttributeFiller = new GateDigiAttributesFiller(
+      fInputDigiCollection, fOutputDigiCollection, names);
+
+  // set input pointers to the attributes needed for computation
+  l.fInputIter = fInputDigiCollection->NewIterator();
+}
+
+void GateVDigitizerWithOutputActor::BeginOfEventAction(const G4Event *event) {
+  auto &l = fThreadLocalVDigitizerData.Get();
+  const int count = event->GetEventID() / std::max(1, fClearEveryNEvents);
+  const bool must_clear = count != l.fOutputCollectionClearCounter;
+  if (must_clear) {
+    l.fOutputCollectionClearCounter = count;
+  }
+  fOutputDigiCollection->FillToRootIfNeeded(must_clear);
+}
+
+// Called every time a Run ends
+void GateVDigitizerWithOutputActor::EndOfRunAction(const G4Run * /*unused*/) {
+  fOutputDigiCollection->FillToRootIfNeeded(true);
+  auto &iter = fThreadLocalVDigitizerData.Get().fInputIter;
+  iter.Reset();
+}
+
+// Called every time a Run ends
+void GateVDigitizerWithOutputActor::EndOfSimulationWorkerAction(
+    const G4Run * /*unused*/) {
+  fOutputDigiCollection->Write();
+}
+
+// Called when the simulation end
+void GateVDigitizerWithOutputActor::EndSimulationAction() {
+  fOutputDigiCollection->Write();
+  fOutputDigiCollection->Close();
+}

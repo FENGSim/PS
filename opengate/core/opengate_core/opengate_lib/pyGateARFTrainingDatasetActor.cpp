@@ -1,0 +1,19 @@
+/* --------------------------------------------------
+   Copyright (C): OpenGATE Collaboration
+   This software is distributed under the terms
+   of the GNU Lesser General  Public Licence (LGPL)
+   See LICENSE.md for further details
+   -------------------------------------------------- */
+
+#include "GateARFTrainingDatasetActor.h"
+#include "digitizer/GateDigitizerHitsCollectionActor.h"
+#include <pybind11/functional.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+void init_GateARFTrainingDatasetActor(py::module &m) {
+  py::class_<GateARFTrainingDatasetActor,
+             std::unique_ptr<GateARFTrainingDatasetActor, py::nodelete>,
+             GateDigitizerHitsCollectionActor>(m, "GateARFTrainingDatasetActor")
+      .def(py::init<py::dict &>());
+}

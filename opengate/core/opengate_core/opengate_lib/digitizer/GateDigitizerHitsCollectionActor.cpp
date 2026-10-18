@@ -1,0 +1,140 @@
+/* --------------------------------------------------
+   Copyright (C): OpenGATE Collaboration
+   This software is distributed under the terms
+   of the GNU Lesser General  Public Licence (LGPL)
+   See LICENSE.md for further details
+   -------------------------------------------------- */
+
+#include "GateDigitizerHitsCollectionActor.h"
+#include "../GateHelpersDict.h"
+#include "GateDigiCollectionManager.h"
+#include <G4RunManager.hh>
+
+GateDigitizerHitsCollectionActor::GateDigitizerHitsCollectionActor(
+    py::dict &user_info)
+    : GateVActor(user_info, true) {
+  // actions
+  fActions.insert("StartSimulationAction");
+  fActions.insert("BeginOfRunAction");
+  fActions.insert("BeginOfEventAction");
+  fActions.insert("SteppingAction");
+  fActions.insert("EndOfRunAction");
+  fActions.insert("EndOfSimulationWorkerAction");
+  fActions.insert("EndSimulationAction");
+  fDebug = false;
+  fKeepZeroEdep = false;
+  fClearEveryNEvents = 100000;
+}
+
+GateDigitizerHitsCollectionActor::~GateDigitizerHitsCollectionActor() = default;
+
+void GateDigitizerHitsCollectionActor::InitializeUserInfo(py::dict &user_info) {
+  GateVActor::InitializeUserInfo(user_info);
+  // options
+  fHitsCollectionName = DictGetStr(user_info, "name");
+  fUserDigiAttributeNames = DictGetVecStr(user_info, "attributes");
+  fDebug = DictGetBool(user_info, "debug");
+  fClearEveryNEvents = DictGetInt(user_info, "clear_every");
+  fKeepZeroEdep = DictGetBool(user_info, "keep_zero_edep");
+}
+
+void GateDigitizerHitsCollectionActor::InitializeCpp() {
+  // init
+  fHits = nullptr;
+}
+
+// Called when the simulation starts
+void GateDigitizerHitsCollectionActor::StartSimulationAction() {
+  auto *dcm = GateDigiCollectionManager::GetInstance();
+  fHits = dcm->NewDigiCollection(fHitsCollectionName);
+  // This order is important: filename and attributes must be set
+  // before Root initialisation
+  std::string outputPath;
+  if (!GetWriteToDisk(fOutputNameRoot)) {
+    outputPath = "";
+  } else {
+    outputPath = GetOutputPath(fOutputNameRoot);
+  }
+  fHits->SetFilenameAndInitRoot(outputPath);
+  fHits->InitDigiAttributesFromNames(fUserDigiAttributeNames);
+  fHits->RootInitializeTupleForMaster();
+  AddOutputTreeInfo(fOutputNameRoot, fHits);
+}
+
+// Called every time a Run starts
+void GateDigitizerHitsCollectionActor::BeginOfRunAction(const G4Run *run) {
+  // Needed to create the root output (only the first run)
+  if (run->GetRunID() == 0)
+    fHits->RootInitializeTupleForWorker();
+}
+
+void GateDigitizerHitsCollectionActor::BeginOfEventAction(
+    const G4Event *event) {
+  /*
+     FillToRootIfNeeded is *required* at the beginning of the event because it
+     calls SetBeginOfEventIndex.
+     The list of hits is cleared every 'fClearEveryNEvents'.
+     There is (almost) no time penalty whatever this value, it only impacts
+     memory (lower is better). Default fClearEveryNEvents value is 1e5. Some
+     other actors may need hits from several events, so we leave the option to
+     keep more events. It only fills to root if needed.
+   */
+  auto &l = fThreadLocalData.Get();
+  const int count = event->GetEventID() / std::max(1, fClearEveryNEvents);
+  const bool must_clear = count != l.fCollectionClearCounter;
+  if (must_clear) {
+    l.fCollectionClearCounter = count;
+  }
+  fHits->FillToRootIfNeeded(must_clear);
+}
+
+// Called every time a batch of steps must be processed
+void GateDigitizerHitsCollectionActor::SteppingAction(G4Step *step) {
+  // Do not store the steps with zero edep
+  if (fKeepZeroEdep || step->GetTotalEnergyDeposit() > 0)
+    fHits->FillHits(step);
+  if (fDebug) {
+    // nb edep = 0
+    const auto s = fHits->DumpLastDigi();
+    const auto id =
+        G4RunManager::GetRunManager()->GetCurrentEvent()->GetEventID();
+    const std::string x =
+        step->GetTotalEnergyDeposit() > 0 ? "" : " (not stored edep=0) ";
+    std::cout << GetName() << " ev=" << id
+              << " track=" << step->GetTrack()->GetTrackID() << " " << x << " "
+              << s << std::endl;
+    // nb transportation
+    const auto post = step->GetPostStepPoint();
+    auto process = post->GetProcessDefinedStep();
+    if (process != nullptr) {
+      const auto pname = process->GetProcessName();
+      static int nb_tr = 0;
+      if (pname == "Transportation") {
+        nb_tr++;
+        std::cout << pname << " " << nb_tr << " " << id << x << std::endl;
+      }
+    }
+  }
+}
+
+// Called every time a Run ends
+void GateDigitizerHitsCollectionActor::EndOfRunAction(const G4Run * /*run*/) {
+  /*
+   * We consider flushing values every run.
+   * If a process needs to access hits across different runs, this should be
+   * moved in EndOfSimulationWorkerAction.
+   */
+  fHits->FillToRootIfNeeded(true);
+}
+
+void GateDigitizerHitsCollectionActor::EndOfSimulationWorkerAction(
+    const G4Run * /*lastRun*/) {
+  // Write only once per worker thread
+  fHits->Write();
+}
+
+// Called when the simulation ends
+void GateDigitizerHitsCollectionActor::EndSimulationAction() {
+  fHits->Write();
+  fHits->Close();
+}

@@ -1,0 +1,330 @@
+/* --------------------------------------------------
+   Copyright (C): OpenGATE Collaboration
+   This software is distributed under the terms
+   of the GNU Lesser General  Public Licence (LGPL)
+   See LICENSE.md for further details
+   -------------------------------------------------- */
+
+#include "GateTDigiAttribute.h"
+#include "../GateHelpers.h"
+#include <G4RootAnalysisManager.hh>
+
+template <class T>
+GateTDigiAttribute<T>::GateTDigiAttribute(std::string vname)
+    : GateVDigiAttribute(vname, 'D') {
+  DDE(typeid(T).name());
+  DDE(vname);
+  Fatal("GateTDigiAttribute constructor must be specialized for this type");
+}
+
+template <class T>
+void GateTDigiAttribute<T>::InitDefaultProcessHitsFunction() {
+  // By default, "do nothing" in the process hit function
+  fProcessHitsFunction = [=](GateVDigiAttribute *att, G4Step *) {};
+}
+
+template <class T> int GateTDigiAttribute<T>::GetSize() const {
+  return static_cast<int>(Values().size());
+}
+
+template <class T> void GateTDigiAttribute<T>::FillDValue(double) {
+  DDE(fDigiAttributeType);
+  DDE(fDigiAttributeName);
+  Fatal("Cannot use FillDValue for this type");
+}
+
+template <class T> void GateTDigiAttribute<T>::FillSValue(std::string) {
+  DDE(fDigiAttributeType);
+  DDE(fDigiAttributeName);
+  Fatal("Cannot use FillSValue for this type");
+}
+
+template <class T> void GateTDigiAttribute<T>::FillIValue(int) {
+  DDE(fDigiAttributeType);
+  DDE(fDigiAttributeName);
+  Fatal("Cannot use FillIValue for this type");
+}
+
+template <class T> void GateTDigiAttribute<T>::FillLValue(int64_t) {
+  DDE(fDigiAttributeType);
+  DDE(fDigiAttributeName);
+  Fatal("Cannot use FillLValue for this type");
+}
+
+template <class T> void GateTDigiAttribute<T>::Fill3Value(G4ThreeVector) {
+  DDE(fDigiAttributeType);
+  DDE(fDigiAttributeName);
+  Fatal("Cannot use Fill3Value for this type");
+}
+
+template <class T>
+void GateTDigiAttribute<T>::FillUValue(GateUniqueVolumeID::Pointer) {
+  DDE(fDigiAttributeType);
+  DDE(fDigiAttributeName);
+  Fatal("Cannot use FillUValue for this type");
+}
+
+template <class T> std::vector<double> &GateTDigiAttribute<T>::GetDValues() {
+  Fatal("Cannot use GetDValues for this type, GateTDigiAttribute<T> D");
+  return *(new std::vector<double>); // to avoid warning
+}
+
+template <class T> std::vector<int> &GateTDigiAttribute<T>::GetIValues() {
+  Fatal("Cannot use GetIValues for this type, GateTDigiAttribute<T> I");
+  return *(new std::vector<int>); // to avoid warning
+}
+
+template <class T> std::vector<int64_t> &GateTDigiAttribute<T>::GetLValues() {
+  Fatal("Cannot use GetLValues for this type, GateTDigiAttribute<T> L");
+  return *(new std::vector<int64_t>); // to avoid warning
+}
+
+template <class T>
+std::vector<std::string> &GateTDigiAttribute<T>::GetSValues() {
+  Fatal("Cannot use GetSValues for this type, GateTDigiAttribute<T> S");
+  return *(new std::vector<std::string>); // to avoid warning
+}
+
+template <class T>
+std::vector<G4ThreeVector> &GateTDigiAttribute<T>::Get3Values() {
+  Fatal("Cannot use Get3Values for this type, GateTDigiAttribute<T> 3");
+  return *(new std::vector<G4ThreeVector>); // to avoid warning
+}
+
+template <class T>
+std::vector<GateUniqueVolumeID::Pointer> &GateTDigiAttribute<T>::GetUValues() {
+  Fatal("Cannot use GetUValues for this type, GateTDigiAttribute<T> U");
+  return *(new std::vector<GateUniqueVolumeID::Pointer>); // to avoid warning
+}
+
+template <class T> void GateTDigiAttribute<T>::Clear() { Values().clear(); }
+
+template <class T>
+const std::vector<T> &GateTDigiAttribute<T>::GetValues() const {
+  return Values();
+}
+
+template <class T> T GateTDigiAttribute<T>::GetSingleValue() const {
+  return threadLocalData.Get().fSingleValue;
+}
+
+template <class T>
+void GateTDigiAttribute<T>::Fill(GateVDigiAttribute *input, size_t index) {
+  // we assume that the given GateVDigiAttribute has the same type
+  auto tinput = static_cast<GateTDigiAttribute<T> *>(input);
+  Values().push_back(tinput->GetValues()[index]);
+}
+
+template <class T> void GateTDigiAttribute<T>::FillDigiWithEmptyValue() {
+  DDE(fDigiAttributeType);
+  DDE(fDigiAttributeName);
+  Fatal("Must not be here, FillDigiWithEmptyValue must be specialized for this "
+        "type");
+}
+
+template <class T>
+void GateTDigiAttribute<T>::FillToRoot(size_t /*index*/) const {
+  DDE(fDigiAttributeType);
+  DDE(fDigiAttributeName);
+  Fatal(
+      "Must not be here, FillToRootIfNeeded must be specialized for this type");
+}
+
+template <class T> std::string GateTDigiAttribute<T>::Dump(int i) const {
+  std::ostringstream oss;
+  oss << Values()[i];
+  return oss.str();
+}
+
+template <>
+GateTDigiAttribute<double>::GateTDigiAttribute(std::string vname)
+    : GateVDigiAttribute(vname, 'D') {
+  InitDefaultProcessHitsFunction();
+}
+
+template <>
+GateTDigiAttribute<int>::GateTDigiAttribute(std::string vname)
+    : GateVDigiAttribute(vname, 'I') {
+  InitDefaultProcessHitsFunction();
+}
+
+template <>
+GateTDigiAttribute<int64_t>::GateTDigiAttribute(std::string vname)
+    : GateVDigiAttribute(vname, 'L') {
+  InitDefaultProcessHitsFunction();
+}
+
+template <>
+GateTDigiAttribute<std::string>::GateTDigiAttribute(std::string vname)
+    : GateVDigiAttribute(vname, 'S') {
+  InitDefaultProcessHitsFunction();
+}
+
+template <>
+GateTDigiAttribute<G4ThreeVector>::GateTDigiAttribute(std::string vname)
+    : GateVDigiAttribute(vname, '3') {
+  InitDefaultProcessHitsFunction();
+}
+
+template <>
+GateTDigiAttribute<GateUniqueVolumeID::Pointer>::GateTDigiAttribute(
+    std::string vname)
+    : GateVDigiAttribute(vname, 'U') {
+  InitDefaultProcessHitsFunction();
+}
+
+template <> void GateTDigiAttribute<double>::FillDigiWithEmptyValue() {
+  Values().push_back(0.0);
+}
+
+template <> void GateTDigiAttribute<int>::FillDigiWithEmptyValue() {
+  Values().push_back(0);
+}
+
+template <> void GateTDigiAttribute<int64_t>::FillDigiWithEmptyValue() {
+  Values().push_back(0);
+}
+
+template <> void GateTDigiAttribute<std::string>::FillDigiWithEmptyValue() {
+  Values().push_back("");
+}
+
+template <> void GateTDigiAttribute<G4ThreeVector>::FillDigiWithEmptyValue() {
+  Values().push_back(G4ThreeVector());
+}
+
+template <>
+void GateTDigiAttribute<GateUniqueVolumeID::Pointer>::FillDigiWithEmptyValue() {
+  auto t = GateUniqueVolumeID::New();
+  Values().push_back(t);
+}
+
+template <> void GateTDigiAttribute<double>::FillDValue(double value) {
+  if (fSingleValueMode) {
+    threadLocalData.Get().fSingleValue = value;
+  } else {
+    Values().push_back(value);
+  }
+}
+
+template <>
+void GateTDigiAttribute<std::string>::FillSValue(std::string value) {
+  if (fSingleValueMode) {
+    threadLocalData.Get().fSingleValue = value;
+  } else {
+    Values().push_back(value);
+  }
+}
+
+template <> void GateTDigiAttribute<int>::FillIValue(int value) {
+  if (fSingleValueMode) {
+    threadLocalData.Get().fSingleValue = value;
+  } else {
+    Values().push_back(value);
+  }
+}
+
+template <> void GateTDigiAttribute<int64_t>::FillLValue(int64_t value) {
+  if (fSingleValueMode) {
+    threadLocalData.Get().fSingleValue = value;
+  } else {
+    Values().push_back(value);
+  }
+}
+
+template <>
+void GateTDigiAttribute<G4ThreeVector>::Fill3Value(G4ThreeVector value) {
+  if (fSingleValueMode) {
+    threadLocalData.Get().fSingleValue = value;
+  } else {
+    Values().push_back(value);
+  }
+}
+
+template <>
+void GateTDigiAttribute<GateUniqueVolumeID::Pointer>::FillUValue(
+    GateUniqueVolumeID::Pointer value) {
+  if (fSingleValueMode) {
+    threadLocalData.Get().fSingleValue = value;
+  } else {
+    Values().push_back(value);
+  }
+}
+
+template <> void GateTDigiAttribute<double>::FillToRoot(size_t index) const {
+  auto *ram = G4RootAnalysisManager::Instance();
+  const auto v = Values()[index];
+  ram->FillNtupleDColumn(GetRootTupleId(), fDigiAttributeId, v);
+}
+
+template <> void GateTDigiAttribute<int>::FillToRoot(size_t index) const {
+  auto *ram = G4RootAnalysisManager::Instance();
+  const auto v = Values()[index];
+  ram->FillNtupleIColumn(GetRootTupleId(), fDigiAttributeId, v);
+}
+
+template <> void GateTDigiAttribute<int64_t>::FillToRoot(size_t index) const {
+  auto *ram = G4RootAnalysisManager::Instance();
+  const auto v = Values()[index];
+  ram->FillNtupleIColumn(GetRootTupleId(), fDigiAttributeId,
+                         static_cast<G4int>(v));
+}
+
+template <>
+void GateTDigiAttribute<std::string>::FillToRoot(size_t index) const {
+  auto *ram = G4RootAnalysisManager::Instance();
+  const auto v = Values()[index];
+  ram->FillNtupleSColumn(GetRootTupleId(), fDigiAttributeId, v);
+}
+
+template <>
+void GateTDigiAttribute<G4ThreeVector>::FillToRoot(size_t index) const {
+  auto *ram = G4RootAnalysisManager::Instance();
+  auto v = Values()[index];
+  ram->FillNtupleDColumn(GetRootTupleId(), fDigiAttributeId, v[0]);
+  ram->FillNtupleDColumn(GetRootTupleId(), fDigiAttributeId + 1, v[1]);
+  ram->FillNtupleDColumn(GetRootTupleId(), fDigiAttributeId + 2, v[2]);
+}
+
+template <>
+void GateTDigiAttribute<GateUniqueVolumeID::Pointer>::FillToRoot(
+    size_t index) const {
+  auto *ram = G4RootAnalysisManager::Instance();
+  const auto v = Values()[index]->fID;
+  ram->FillNtupleSColumn(GetRootTupleId(), fDigiAttributeId, v);
+}
+
+template <> std::vector<double> &GateTDigiAttribute<double>::GetDValues() {
+  return Values();
+}
+
+template <> std::vector<int> &GateTDigiAttribute<int>::GetIValues() {
+  return Values();
+}
+
+template <> std::vector<int64_t> &GateTDigiAttribute<int64_t>::GetLValues() {
+  return Values();
+}
+
+template <>
+std::vector<std::string> &GateTDigiAttribute<std::string>::GetSValues() {
+  return Values();
+}
+
+template <>
+std::vector<G4ThreeVector> &GateTDigiAttribute<G4ThreeVector>::Get3Values() {
+  return Values();
+}
+
+template <>
+std::vector<GateUniqueVolumeID::Pointer> &
+GateTDigiAttribute<GateUniqueVolumeID::Pointer>::GetUValues() {
+  return Values();
+}
+
+template class GateTDigiAttribute<double>;
+template class GateTDigiAttribute<int>;
+template class GateTDigiAttribute<int64_t>;
+template class GateTDigiAttribute<std::string>;
+template class GateTDigiAttribute<G4ThreeVector>;
+template class GateTDigiAttribute<GateUniqueVolumeID::Pointer>;

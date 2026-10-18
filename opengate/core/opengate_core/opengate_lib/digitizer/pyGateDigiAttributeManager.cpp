@@ -1,0 +1,28 @@
+/* --------------------------------------------------
+   Copyright (C): OpenGATE Collaboration
+   This software is distributed under the terms
+   of the GNU Lesser General  Public Licence (LGPL)
+   See LICENSE.md for further details
+   -------------------------------------------------- */
+
+#include "GateDigiAttributeManager.h"
+#include <pybind11/functional.h>
+#include <pybind11/pybind11.h>
+
+namespace py = pybind11;
+
+void init_GateDigiAttributeManager(py::module &m) {
+
+  py::class_<GateDigiAttributeManager,
+             std::unique_ptr<GateDigiAttributeManager, py::nodelete>>(
+      m, "GateDigiAttributeManager")
+      .def("DefineDigiAttribute",
+           &GateDigiAttributeManager::DefineDigiAttribute)
+      .def("GetInstance", &GateDigiAttributeManager::GetInstance)
+      .def("DumpAvailableDigiAttributeNames",
+           &GateDigiAttributeManager::DumpAvailableDigiAttributeNames)
+      .def("GetDigiAttributeByName",
+           &GateDigiAttributeManager::GetDigiAttributeByName)
+      .def("GetAvailableDigiAttributeNames",
+           &GateDigiAttributeManager::GetAvailableDigiAttributeNames);
+}

@@ -1,0 +1,23 @@
+/* --------------------------------------------------
+   Copyright (C): OpenGATE Collaboration
+   This software is distributed under the terms
+   of the GNU Lesser General  Public Licence (LGPL)
+   See LICENSE.md for further details
+   -------------------------------------------------- */
+
+#include "GateGenericSource.h"
+#include <pybind11/pybind11.h>
+
+void init_GateGenericSource(py::module &m) {
+
+  py::class_<GateGenericSource, GateVSource>(m, "GateGenericSource")
+      .def(py::init())
+      //.def_readonly("fNumberOfGeneratedEvents",
+      //              &GateGenericSource::fNumberOfGeneratedEvents)
+      .def("InitializeUserInfo", &GateGenericSource::InitializeUserInfo)
+      .def("SetEnergyCDF", &GateGenericSource::SetEnergyCDF)
+      .def("SetProbabilityCDF", &GateGenericSource::SetProbabilityCDF)
+      .def("GetTotalSkippedEvents", &GateGenericSource::GetTotalSkippedEvents)
+      .def("GetTotalZeroEvents", &GateGenericSource::GetTotalZeroEvents)
+      .def("SetTAC", &GateGenericSource::SetTAC);
+}
